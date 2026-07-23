@@ -22,7 +22,7 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 import sys
@@ -173,8 +173,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.2")
-APP_CODE_SIGNATURE = "production-hardening-v8"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.3")
+APP_CODE_SIGNATURE = "progressive-storage-recovery-v9"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", str(8 * 1024 * 1024)))
@@ -284,6 +284,8 @@ def _admin_write_route(request: Request) -> bool:
     if path in {"/api/ops/skills", "/api/ops/skills/import"}:
         return True
     if path.startswith("/api/ops/skills/") and (request.method == "DELETE" or path.endswith("/delete")):
+        return True
+    if request.method == "DELETE" and path.startswith("/api/ops/records/"):
         return True
     return False
 
@@ -618,12 +620,23 @@ def _persist_ops_jobs() -> None:
         return
     try:
         OPS_JOB_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=max(1, int(os.getenv("OPS_RECORD_RETENTION_DAYS", "365")))
+        )
+        retained_jobs = []
+        for job in OPS_JOBS.values():
+            try:
+                created_at = datetime.fromisoformat(str(job.get("created_at") or "").replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                created_at = datetime.now(timezone.utc)
+            if created_at >= cutoff:
+                retained_jobs.append(job)
         payload = {
             "version": 1,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "jobs": [
                 _redact_sensitive(job)
-                for job in list(OPS_JOBS.values())[-int(os.getenv("OPS_JOB_STORE_LIMIT", "200")):]
+                for job in retained_jobs[-int(os.getenv("OPS_JOB_STORE_LIMIT", "5000")):]
             ],
         }
         temporary = OPS_JOB_STORE_PATH.with_suffix(f"{OPS_JOB_STORE_PATH.suffix}.tmp")
@@ -5926,6 +5939,13 @@ def _normalize_k8s_events(raw_items: list[dict]) -> list[dict]:
 
 
 def _workload_api_path(kind: str, namespace: str, name: str) -> str:
+    normalized = str(kind or "deployment").lower()
+    if normalized in {"job", "jobs"}:
+        return f"/apis/batch/v1/namespaces/{quote(namespace, safe='')}/jobs/{quote(name, safe='')}"
+    if normalized in {"cronjob", "cronjobs"}:
+        return f"/apis/batch/v1/namespaces/{quote(namespace, safe='')}/cronjobs/{quote(name, safe='')}"
+    if normalized in {"pod", "pods"}:
+        return f"/api/v1/namespaces/{quote(namespace, safe='')}/pods/{quote(name, safe='')}"
     plural = {
         "deployment": "deployments",
         "statefulset": "statefulsets",
@@ -5942,7 +5962,13 @@ def _workload_collection_api_path(kind: str, namespace: str) -> str:
 def _safe_workload_evidence(raw: dict) -> dict:
     metadata = raw.get("metadata") or {}
     spec = raw.get("spec") or {}
-    pod_spec = ((spec.get("template") or {}).get("spec") or {})
+    kind = str(raw.get("kind") or "")
+    if kind == "CronJob":
+        pod_spec = (((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("spec") or {}
+    elif kind == "Pod":
+        pod_spec = spec
+    else:
+        pod_spec = ((spec.get("template") or {}).get("spec") or {})
     containers = []
     for container in pod_spec.get("containers", []) or []:
         containers.append({
@@ -5956,9 +5982,16 @@ def _safe_workload_evidence(raw: dict) -> dict:
             ],
         })
     return {
-        "apiVersion": raw.get("apiVersion"), "kind": raw.get("kind"),
+        "apiVersion": raw.get("apiVersion"), "kind": kind,
         "metadata": {"name": metadata.get("name"), "namespace": metadata.get("namespace"), "generation": metadata.get("generation")},
-        "spec": {"replicas": spec.get("replicas"), "strategy": spec.get("strategy"), "template": {"spec": {
+        "spec": {
+            "replicas": spec.get("replicas"),
+            "completions": spec.get("completions"),
+            "parallelism": spec.get("parallelism"),
+            "suspend": spec.get("suspend"),
+            "schedule": spec.get("schedule"),
+            "strategy": spec.get("strategy"),
+            "template": {"spec": {
             "containers": containers, "volumes": pod_spec.get("volumes", []), "securityContext": pod_spec.get("securityContext", {}),
             "imagePullSecrets": pod_spec.get("imagePullSecrets", []), "nodeSelector": pod_spec.get("nodeSelector", {}),
             "tolerations": pod_spec.get("tolerations", []), "affinity": pod_spec.get("affinity", {}),
@@ -6193,6 +6226,90 @@ def _materialize_patch(value):
     return value
 
 
+def _workload_api_version(kind: str) -> str:
+    normalized = str(kind or "").lower()
+    if normalized in {"job", "jobs", "cronjob", "cronjobs"}:
+        return "batch/v1"
+    if normalized in {"pod", "pods"}:
+        return "v1"
+    return "apps/v1"
+
+
+def _workload_patch_for_kind(kind: str, patch: dict) -> dict:
+    """Convert the canonical pod-template patch into the owning API shape."""
+    normalized = str(kind or "").lower()
+    if normalized in {"cronjob", "cronjobs"}:
+        spec = copy.deepcopy((patch or {}).get("spec") or {})
+        template = spec.pop("template", None)
+        if template is not None:
+            spec.setdefault("jobTemplate", {}).setdefault("spec", {})["template"] = template
+        return {"spec": spec}
+    return patch
+
+
+def _prepare_immutable_replacement(raw: dict, kind: str, canonical_patch: dict) -> dict:
+    """Apply a bounded canonical Pod template patch to a live Pod/Job snapshot."""
+    item = copy.deepcopy(raw)
+    normalized = str(kind or "").lower()
+    owners = ((item.get("metadata") or {}).get("ownerReferences") or [])
+    if normalized == "pod":
+        if owners:
+            raise ValueError("controller-owned Pod must be patched through its highest controller")
+        pod_spec = item.setdefault("spec", {})
+    elif normalized == "job":
+        if owners:
+            raise ValueError("controller-owned Job must be patched through its highest controller")
+        pod_spec = item.setdefault("spec", {}).setdefault("template", {}).setdefault("spec", {})
+    else:
+        raise ValueError("immutable replacement only supports Pod or Job")
+
+    def merge(target: dict, patch: dict) -> None:
+        for key, value in patch.items():
+            if key == "containers" and isinstance(value, list):
+                existing = {
+                    str(entry.get("name") or ""): entry
+                    for entry in target.get("containers") or []
+                    if isinstance(entry, dict)
+                }
+                for container_patch in value:
+                    current = existing.get(str((container_patch or {}).get("name") or ""))
+                    if current is None:
+                        raise ValueError("container patch target does not exist")
+                    merge(current, container_patch)
+            elif isinstance(value, dict) and isinstance(target.get(key), dict):
+                merge(target[key], value)
+            else:
+                target[key] = copy.deepcopy(value)
+
+    canonical_spec = (((canonical_patch.get("spec") or {}).get("template") or {}).get("spec") or {})
+    merge(pod_spec, canonical_spec)
+    item.pop("status", None)
+    metadata = item.setdefault("metadata", {})
+    for key in (
+        "uid", "resourceVersion", "generation", "creationTimestamp",
+        "deletionTimestamp", "deletionGracePeriodSeconds", "managedFields",
+    ):
+        metadata.pop(key, None)
+    if normalized == "job":
+        generated_labels = {
+            "controller-uid",
+            "batch.kubernetes.io/controller-uid",
+            "job-name",
+            "batch.kubernetes.io/job-name",
+        }
+        job_spec = item.setdefault("spec", {})
+        job_spec.pop("selector", None)
+        job_spec.pop("manualSelector", None)
+        for label_map in (
+            metadata.get("labels"),
+            ((job_spec.get("template") or {}).get("metadata") or {}).get("labels"),
+        ):
+            if isinstance(label_map, dict):
+                for label in generated_labels:
+                    label_map.pop(label, None)
+    return item
+
+
 def _target_pod_from_plan(plan: dict) -> str:
     evidence = plan.get("evidence") or {}
     pod = evidence.get("pod") if isinstance(evidence, dict) else {}
@@ -6233,6 +6350,7 @@ def _permission_guidance(error_payload: dict | str, plan: dict, change: dict | N
         "patch_workload": (["get", "patch"], ["deployments", "statefulsets", "daemonsets"]),
         "patch_workload_volume": (["get", "patch"], ["deployments", "statefulsets", "daemonsets", "persistentvolumeclaims"]),
         "patch_workload_runtime_security": (["get", "patch"], ["deployments", "statefulsets", "daemonsets", "pods/log", "events"]),
+        "replace_immutable_workload": (["get", "create", "delete"], ["pods", "jobs"]),
         "create_pvc": (["get", "create"], ["persistentvolumeclaims"]),
         "create_pv": (["get", "create"], ["persistentvolumes", "persistentvolumeclaims"]),
         "cordon_node": (["get", "patch"], ["nodes"]),
@@ -6511,6 +6629,8 @@ def _validate_storage_manifest(manifest: dict, kind: str, namespace: str = "") -
     if kind == "PersistentVolume":
         if spec.get("hostPath"):
             return False, "PV hostPath is not allowed by the AIOps safety policy"
+        if spec.get("persistentVolumeReclaimPolicy") != "Retain":
+            return False, "automatically proposed PV must use persistentVolumeReclaimPolicy=Retain"
         capacity = (spec.get("capacity") or {}).get("storage")
         if not capacity:
             return False, "PV spec.capacity.storage is required"
@@ -6525,8 +6645,10 @@ def _validate_storage_manifest(manifest: dict, kind: str, namespace: str = "") -
         if not any(spec.get(key) for key in allowed_sources):
             return False, "PV must use an approved network or CSI storage source; hostPath is forbidden"
         claim_ref = spec.get("claimRef") or {}
-        if claim_ref and (not claim_ref.get("name") or not claim_ref.get("namespace")):
-            return False, "PV claimRef must include namespace and name"
+        if not claim_ref.get("name") or not claim_ref.get("namespace"):
+            return False, "statically proposed PV must be pre-bound with claimRef namespace and name"
+        if spec.get("volumeMode") not in {"Filesystem", "Block"}:
+            return False, "PV volumeMode must explicitly match the PVC as Filesystem or Block"
         return True, ""
     return False, f"unsupported storage kind: {kind}"
 
@@ -6643,6 +6765,18 @@ async def _collect_plan_deep_evidence(plan: dict) -> dict:
         )
         pod = _normalize_k8s_pod(raw.get("raw_pod") or {}, {})
         workload = _safe_workload_evidence(raw.get("workload") or {}) if raw.get("workload") else {}
+        if workload.get("kind"):
+            pod["workload_kind"] = workload.get("kind")
+            pod["workload_name"] = (workload.get("metadata") or {}).get("name") or pod.get("workload_name")
+        managed_storage = [
+            {
+                **item,
+                "cluster_id": cluster_id,
+                "node": (raw.get("node") or {}).get("name") or pod.get("node"),
+            }
+            for item in (raw.get("storage") or [])
+            if isinstance(item, dict)
+        ]
         return _redact_sensitive({
             "namespace": namespace,
             "pod_name": pod_name,
@@ -6650,7 +6784,7 @@ async def _collect_plan_deep_evidence(plan: dict) -> dict:
             "events": _normalize_k8s_events(raw.get("events") or []),
             "logs": raw.get("logs") or {},
             "workload": workload,
-            "storage": raw.get("storage") or [],
+            "storage": managed_storage,
             "services": raw.get("services") or [],
             "node": raw.get("node") or {},
             "credential_evidence": raw.get("credential_evidence") or [],
@@ -6666,6 +6800,7 @@ async def _collect_plan_deep_evidence(plan: dict) -> dict:
     ns = quote(namespace, safe="")
     pod_q = quote(pod_name, safe="")
     raw_pod = await _rancher_k8s_get(cluster_id, f"/api/v1/namespaces/{ns}/pods/{pod_q}", timeout=25)
+    resolved_batch_owner: tuple[str, str] | None = None
     if not replica_owner:
         owners = (raw_pod.get("metadata") or {}).get("ownerReferences") or []
         rs_name = next((owner.get("name") for owner in owners if owner.get("kind") == "ReplicaSet"), "")
@@ -6678,7 +6813,26 @@ async def _collect_plan_deep_evidence(plan: dict) -> dict:
                     replica_owner[rs_name] = (owner.get("kind", "Deployment"), owner.get("name", ""))
             except Exception:
                 pass
+    owners = (raw_pod.get("metadata") or {}).get("ownerReferences") or []
+    job_name = next((owner.get("name") for owner in owners if owner.get("kind") == "Job"), "")
+    if job_name:
+        try:
+            raw_job = await _rancher_k8s_get(
+                cluster_id,
+                f"/apis/batch/v1/namespaces/{ns}/jobs/{quote(job_name, safe='')}",
+                timeout=18,
+            )
+            job_owners = (raw_job.get("metadata") or {}).get("ownerReferences") or []
+            cron_owner = next((owner for owner in job_owners if owner.get("kind") == "CronJob"), None)
+            resolved_batch_owner = (
+                "CronJob",
+                str(cron_owner.get("name") or ""),
+            ) if cron_owner else ("Job", str(job_name))
+        except Exception:
+            resolved_batch_owner = ("Job", str(job_name))
     pod = _normalize_k8s_pod(raw_pod, replica_owner)
+    if resolved_batch_owner:
+        pod["workload_kind"], pod["workload_name"] = resolved_batch_owner
     selector = quote(f"involvedObject.name={pod_name}", safe="=,")
     event_payload = await _rancher_k8s_get(cluster_id, f"/api/v1/namespaces/{ns}/events?fieldSelector={selector}", timeout=20)
     events = _normalize_k8s_events(event_payload.get("items", []) if isinstance(event_payload, dict) else [])
@@ -6700,22 +6854,43 @@ async def _collect_plan_deep_evidence(plan: dict) -> dict:
                     pv = await _rancher_k8s_get(cluster_id, f"/api/v1/persistentvolumes/{quote(pv_name, safe='')}", timeout=18)
                 except Exception as exc:
                     pv = {"error": f"{type(exc).__name__}: {exc}"}
+            storage_class = (pvc.get("spec") or {}).get("storageClassName")
+            storage_class_record = {}
+            if storage_class:
+                try:
+                    storage_class_record = await _rancher_k8s_get(
+                        cluster_id,
+                        f"/apis/storage.k8s.io/v1/storageclasses/{quote(storage_class, safe='')}",
+                        timeout=18,
+                    )
+                except Exception as exc:
+                    storage_class_record = {"error": f"{type(exc).__name__}: {_redact_text(str(exc))}"}
             storage.append({
+                "cluster_id": cluster_id,
                 "volume": volume.get("name"),
                 "pvc": claim,
                 "pvc_phase": (pvc.get("status") or {}).get("phase"),
                 "requested": (((pvc.get("spec") or {}).get("resources") or {}).get("requests") or {}).get("storage"),
                 "capacity": ((pvc.get("status") or {}).get("capacity") or {}).get("storage"),
-                "storage_class": (pvc.get("spec") or {}).get("storageClassName"),
+                "storage_class": storage_class,
+                "storage_class_provisioner": storage_class_record.get("provisioner"),
+                "volume_binding_mode": storage_class_record.get("volumeBindingMode"),
+                "allow_volume_expansion": storage_class_record.get("allowVolumeExpansion"),
+                "storage_class_error": storage_class_record.get("error"),
                 "access_modes": (pvc.get("spec") or {}).get("accessModes") or [],
+                "volume_mode": (pvc.get("spec") or {}).get("volumeMode") or "Filesystem",
+                "selector": (pvc.get("spec") or {}).get("selector") or {},
                 "pv": pv_name,
                 "pv_phase": (pv.get("status") or {}).get("phase"),
+                "pv_reclaim_policy": (pv.get("spec") or {}).get("persistentVolumeReclaimPolicy"),
+                "pv_node_affinity": (pv.get("spec") or {}).get("nodeAffinity") or {},
                 "csi_driver": (((pv.get("spec") or {}).get("csi") or {}).get("driver")),
                 "nfs": bool((pv.get("spec") or {}).get("nfs")),
                 "pv_error": pv.get("error"),
             })
         except Exception as exc:
             storage.append({
+                "cluster_id": cluster_id,
                 "volume": volume.get("name"),
                 "pvc": claim,
                 "missing": True,
@@ -6800,13 +6975,18 @@ async def _collect_plan_deep_evidence(plan: dict) -> dict:
     workload_type = pod.get("workload_kind") or workload_type or (plan.get("changes") or [{}])[0].get("workload_type") or "Deployment"
     workload_name = pod.get("workload_name") or workload_name
     workload = {}
-    if workload_name and str(workload_type).lower() in {"deployment", "statefulset", "daemonset"}:
+    if workload_name and str(workload_type).lower() in {
+        "deployment", "statefulset", "daemonset", "job", "cronjob", "pod",
+    }:
         try:
             workload = _safe_workload_evidence(
                 await _rancher_k8s_get(cluster_id, _workload_api_path(workload_type, namespace, workload_name), timeout=25)
             )
         except Exception as exc:
             workload = {"error": f"{type(exc).__name__}: {exc}"}
+    for item in storage:
+        if isinstance(item, dict):
+            item.setdefault("node", node_name)
     return _redact_sensitive({
         "namespace": namespace, "pod_name": pod_name, "pod": pod, "events": events,
         "logs": logs, "workload": workload, "storage": storage, "services": services,
@@ -6816,6 +6996,28 @@ async def _collect_plan_deep_evidence(plan: dict) -> dict:
             name: {key: value for key, value in (content or {}).items() if key.endswith("_error") and value}
             for name, content in logs.items()
             if any((content or {}).get(key) for key in ("current_error", "previous_error"))
+        },
+    })
+
+
+def _ops_evidence_snapshot(evidence: dict) -> dict:
+    """Create the persistent, redacted before/after incident snapshot."""
+    logs = evidence.get("logs") or {}
+    return _redact_sensitive({
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "pod": evidence.get("pod") or {},
+        "workload": evidence.get("workload") or {},
+        "storage": evidence.get("storage") or [],
+        "events": (evidence.get("events") or [])[-30:],
+        "log_summary": {
+            str(name): {
+                "current_tail": _clip_text((content or {}).get("current") or "", 1200),
+                "previous_tail": _clip_text((content or {}).get("previous") or "", 1200),
+                "current_error": (content or {}).get("current_error") or "",
+                "previous_error": (content or {}).get("previous_error") or "",
+            }
+            for name, content in logs.items()
+            if isinstance(content, dict)
         },
     })
 
@@ -7117,23 +7319,74 @@ async def _execute_change(change: dict, plan: dict) -> dict:
                 {"apiVersion": "v1", "kind": "DeleteOptions", "propagationPolicy": "Background"},
                 timeout=40,
             )
+        elif use_managed_cluster and ctype == "replace_immutable_workload":
+            result = await asyncio.to_thread(
+                CLUSTER_REGISTRY.replace_immutable_workload,
+                cluster_id,
+                kind=str(change.get("kind") or workload_type),
+                name=str(change.get("name") or workload_name),
+                namespace=namespace,
+                pod_template_patch=change.get("patch") or {},
+            )
+        elif use_rancher and ctype == "replace_immutable_workload":
+            immutable_kind = str(change.get("kind") or workload_type)
+            immutable_name = str(change.get("name") or workload_name)
+            item_path = _workload_api_path(immutable_kind, namespace, immutable_name)
+            live_object = await _rancher_k8s_get(cluster_id, item_path, timeout=25)
+            replacement = _prepare_immutable_replacement(
+                live_object,
+                immutable_kind,
+                change.get("patch") or {},
+            )
+            await _rancher_k8s_delete(
+                cluster_id,
+                item_path,
+                {"apiVersion": "v1", "kind": "DeleteOptions", "propagationPolicy": "Foreground"},
+                timeout=40,
+            )
+            deletion_deadline = time.monotonic() + 30
+            while time.monotonic() < deletion_deadline:
+                try:
+                    await _rancher_k8s_get(cluster_id, item_path, timeout=5)
+                except Exception as exc:
+                    if "404" in str(exc) or "not found" in str(exc).lower():
+                        break
+                    raise
+                await asyncio.sleep(0.5)
+            else:
+                raise TimeoutError(f"{immutable_kind}/{immutable_name} was not deleted within 30 seconds")
+            result = await _rancher_k8s_post(
+                cluster_id,
+                _workload_collection_api_path(immutable_kind, namespace),
+                replacement,
+                timeout=40,
+            )
         elif use_managed_cluster and ctype in workload_change_types:
             manifest_kind = str(workload_type or "Deployment")
-            api_version = "apps/v1"
+            api_version = _workload_api_version(manifest_kind)
             patch = _materialize_patch(change.get("patch") or {})
             if ctype == "restart":
                 patch = _materialize_patch({"spec": {"template": {"metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": "<now>"}}}}})
             elif ctype == "scale_out":
                 patch = {"spec": {"replicas": int(change.get("replicas") or 2)}}
-            result = await asyncio.to_thread(
-                CLUSTER_REGISTRY.patch_resource,
-                cluster_id,
-                api_version=api_version,
-                kind=manifest_kind,
-                name=workload_name,
-                namespace=namespace,
-                patch=patch,
+            valid, reason = _validate_workload_patch(
+                patch,
+                allow_volume_patch=ctype == "patch_workload_volume",
+                allow_init_containers=operator_confirmed,
             )
+            if not valid:
+                result = {"error": f"patch rejected by safety policy: {reason}"}
+            else:
+                patch = _workload_patch_for_kind(manifest_kind, patch)
+                result = await asyncio.to_thread(
+                    CLUSTER_REGISTRY.patch_resource,
+                    cluster_id,
+                    api_version=api_version,
+                    kind=manifest_kind,
+                    name=workload_name,
+                    namespace=namespace,
+                    patch=patch,
+                )
         elif _is_infrastructure_action(str(ctype)):
             result = await _execute_infrastructure_action(change, plan)
         elif use_rancher and ctype in workload_change_types:
@@ -7151,6 +7404,7 @@ async def _execute_change(change: dict, plan: dict) -> dict:
             if not valid:
                 result = {"error": f"patch rejected by safety policy: {reason}"}
             else:
+                patch = _workload_patch_for_kind(workload_type, patch)
                 result = await _rancher_k8s_patch(
                     cluster_id,
                     _workload_api_path(workload_type, namespace, workload_name),
@@ -7299,6 +7553,14 @@ async def _execute_change(change: dict, plan: dict) -> dict:
                     "patch": patch,
                     "dry_run": False,
                 })
+        elif ctype == "replace_immutable_workload":
+            result = await _call_mcp_tool("replace_immutable_workload", {
+                "namespace": namespace,
+                "kind": change.get("kind") or workload_type,
+                "name": change.get("name") or workload_name,
+                "pod_template_patch": change.get("patch") or {},
+                "dry_run": False,
+            })
         elif ctype in {"patch_workload", "patch_workload_volume", "patch_workload_runtime_security", "patch", "rollback_workload"}:
             patch = _materialize_patch(change.get("patch") or {})
             valid, reason = _validate_workload_patch(
@@ -7504,7 +7766,7 @@ async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
     change_type = first_change.get("type")
     namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
     workload_scoped = str(workload_type or "").lower() in {
-        "deployment", "statefulset", "daemonset", "replicaset",
+        "deployment", "statefulset", "daemonset", "replicaset", "job", "cronjob", "pod",
     } and bool(workload_name)
     resource_verification: dict | None = None
     if not plan.get("changes") and not workload_scoped:
@@ -7724,6 +7986,8 @@ async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
     unresolved = []
     for pod in matched_for_health:
         category, severity, reason = _classify_pod_issue(pod, [])
+        if _pod_completed_successfully(pod):
+            continue
         if category or not pod.get("ready"):
             unresolved.append({
                 "name": pod.get("name"),
@@ -7775,7 +8039,7 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
     _namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
     mandatory = ["pod_ready"] if workload_name else []
     if workload_name and str(workload_type or "").lower() in {
-        "deployment", "statefulset", "daemonset", "replicaset",
+        "deployment", "statefulset", "daemonset", "replicaset", "job", "cronjob",
     }:
         mandatory.append("rollout_complete")
     normalized_requested = {item.strip().lower().replace(" ", "_") for item in requested}
@@ -7802,14 +8066,35 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
     desired = int(spec.get("replicas") or 1)
     generation = int(metadata.get("generation") or 0)
     observed_generation = int(status.get("observedGeneration") or 0)
-    rollout_complete = bool(
-        workload
-        and (not generation or observed_generation >= generation)
-        and int(status.get("updatedReplicas") or status.get("currentReplicas") or desired) >= desired
-        and int(status.get("readyReplicas") or status.get("numberReady") or 0) >= desired
-    )
+    normalized_workload_type = str(workload_type or "").lower()
+    if normalized_workload_type == "job":
+        completions = int(spec.get("completions") or 1)
+        rollout_complete = bool(
+            workload
+            and int(status.get("failed") or 0) == 0
+            and (
+                int(status.get("succeeded") or 0) >= completions
+                or (verification.get("recovered") is True and int(status.get("active") or 0) > 0)
+            )
+        )
+    elif normalized_workload_type == "cronjob":
+        rollout_complete = bool(
+            workload
+            and verification.get("recovered") is True
+            and not bool(status.get("lastScheduleTime") and status.get("active") is None and spec.get("suspend"))
+        )
+    else:
+        rollout_complete = bool(
+            workload
+            and (not generation or observed_generation >= generation)
+            and int(status.get("updatedReplicas") or status.get("currentReplicas") or desired) >= desired
+            and int(status.get("readyReplicas") or status.get("numberReady") or 0) >= desired
+        )
     known: dict[str, tuple[bool | None, str]] = {
-        "pod_ready": (verification.get("recovered") is True and bool(pod and pod.get("ready")), "活动 Pod 均为 Ready"),
+        "pod_ready": (
+            verification.get("recovered") is True and bool(pod and (pod.get("ready") or _pod_completed_successfully(pod))),
+            "活动 Pod 均为 Ready，或 Job Pod 已成功完成",
+        ),
         "rollout_complete": (rollout_complete if workload else None, "Workload observedGeneration 与可用副本已收敛"),
         "restart_count_stable": (current_restarts <= max(1, baseline_restarts), f"restart_count={current_restarts}, baseline={baseline_restarts}"),
         "events_no_new_backoff": (not any(term in text for term in ("backoff", "back-off restarting", "failedmount", "errimagepull")), "新 Pod Events 无 BackOff/FailedMount/ImagePull"),
@@ -7899,8 +8184,39 @@ async def _verify_plan_recovery(
     timeout_seconds = max(0, int(os.getenv("OPS_VERIFY_TIMEOUT_SECONDS", "45")))
     interval_seconds = max(1, int(os.getenv("OPS_VERIFY_INTERVAL_SECONDS", "5")))
     initial_grace_seconds = max(0, int(os.getenv("OPS_VERIFY_INITIAL_GRACE_SECONDS", "15")))
+    stability_seconds = max(0, int(os.getenv("OPS_RECOVERY_STABILITY_SECONDS", "0")))
     deadline = time.monotonic() + timeout_seconds
     attempts = 0
+
+    async def assess_all_recovered_pods(probe: dict) -> tuple[dict, list[dict]]:
+        recovered_pods = [str(item) for item in (probe.get("recovered_pods") or []) if str(item)]
+        if not recovered_pods:
+            recovered_pods = [str(_target_pod_from_plan(plan) or "")]
+        evaluations: list[dict] = []
+        aggregate: dict | None = None
+        for recovered_pod in recovered_pods[:20]:
+            verification_plan = copy.deepcopy(plan)
+            if recovered_pod:
+                verification_plan["pod_name"] = recovered_pod
+            fresh_evidence = await _collect_plan_deep_evidence(verification_plan)
+            if fresh_evidence.get("error"):
+                raise RuntimeError(str(fresh_evidence.get("error")))
+            criteria = _assess_recovery_criteria(plan, probe, fresh_evidence)
+            evaluations.append({
+                "pod": recovered_pod or (fresh_evidence.get("pod") or {}).get("name"),
+                "criteria": criteria,
+                "snapshot": _ops_evidence_snapshot(fresh_evidence),
+            })
+            if aggregate is None:
+                aggregate = copy.deepcopy(criteria)
+            else:
+                aggregate["failed"] = sorted({*(aggregate.get("failed") or []), *(criteria.get("failed") or [])})
+                aggregate["not_evaluated"] = sorted({
+                    *(aggregate.get("not_evaluated") or []),
+                    *(criteria.get("not_evaluated") or []),
+                })
+                aggregate["passed"] = not aggregate["failed"] and not aggregate["not_evaluated"]
+        return aggregate or {"passed": False, "failed": [], "not_evaluated": ["pod_evidence"]}, evaluations
     if initial_grace_seconds:
         grace_deadline = time.monotonic() + min(initial_grace_seconds, timeout_seconds)
         while time.monotonic() < grace_deadline:
@@ -7935,15 +8251,13 @@ async def _verify_plan_recovery(
         last = await _probe_plan_recovery(plan, results)
     if last.get("recovered") is True:
         try:
-            verification_plan = copy.deepcopy(plan)
-            recovered_pods = last.get("recovered_pods") or []
-            if recovered_pods:
-                verification_plan["pod_name"] = recovered_pods[0]
-            fresh_evidence = await _collect_plan_deep_evidence(verification_plan)
-            if fresh_evidence.get("error"):
-                raise RuntimeError(str(fresh_evidence.get("error")))
-            criteria = _assess_recovery_criteria(plan, last, fresh_evidence)
+            criteria, pod_evaluations = await assess_all_recovered_pods(last)
             last["criteria"] = criteria
+            last["after_snapshot"] = [item.get("snapshot") for item in pod_evaluations]
+            last["pod_evaluations"] = [
+                {key: value for key, value in item.items() if key != "snapshot"}
+                for item in pod_evaluations
+            ]
             if criteria.get("failed"):
                 last.update({
                     "status": "needs_followup",
@@ -7956,6 +8270,74 @@ async def _verify_plan_recovery(
                     "recovered": None,
                     "message": "Pod Ready，但仍有恢复判据缺少可验证证据；事件保持打开并继续补充诊断方案。",
                 })
+            elif stability_seconds:
+                stable_started = time.monotonic()
+                stable_deadline = stable_started + stability_seconds
+                stability_samples = [{
+                    "at_seconds": 0,
+                    "pods": [item.get("pod") for item in pod_evaluations],
+                    "passed": True,
+                }]
+                while time.monotonic() < stable_deadline:
+                    if cancel_event and cancel_event.is_set():
+                        last.update({
+                            "status": "cancelled",
+                            "recovered": False,
+                            "message": "持续稳定验证被操作员中断；故障不会标记为恢复。",
+                        })
+                        break
+                    await asyncio.sleep(min(interval_seconds, max(0.0, stable_deadline - time.monotonic())))
+                    stability_probe = await _probe_plan_recovery(plan, results)
+                    if stability_probe.get("recovered") is not True:
+                        last = {
+                            **stability_probe,
+                            "status": "needs_followup",
+                            "recovered": False,
+                            "message": "持续稳定窗内 Pod/副本再次异常，恢复判定已撤销并进入下一方案。",
+                            "stability_samples": stability_samples,
+                        }
+                        break
+                    sample_criteria, sample_pods = await assess_all_recovered_pods(stability_probe)
+                    sample_passed = bool(sample_criteria.get("passed"))
+                    stability_samples.append({
+                        "at_seconds": round(time.monotonic() - stable_started, 1),
+                        "pods": [item.get("pod") for item in sample_pods],
+                        "passed": sample_passed,
+                        "failed": sample_criteria.get("failed") or [],
+                        "not_evaluated": sample_criteria.get("not_evaluated") or [],
+                    })
+                    if not sample_passed:
+                        last = {
+                            **stability_probe,
+                            "status": "needs_followup",
+                            "recovered": False,
+                            "message": "持续稳定窗内出现新的 Events/日志/副本异常，恢复判定已撤销并进入下一方案。",
+                            "criteria": sample_criteria,
+                            "pod_evaluations": [
+                                {key: value for key, value in item.items() if key != "snapshot"}
+                                for item in sample_pods
+                            ],
+                            "stability_samples": stability_samples,
+                        }
+                        break
+                    last = {
+                        **stability_probe,
+                        "criteria": sample_criteria,
+                        "pod_evaluations": [
+                            {key: value for key, value in item.items() if key != "snapshot"}
+                            for item in sample_pods
+                        ],
+                        "after_snapshot": [item.get("snapshot") for item in sample_pods],
+                    }
+                else:
+                    last.update({
+                        "status": "verified",
+                        "recovered": True,
+                        "message": f"全部新 Pod、期望副本、Events 与容器日志已连续 {stability_seconds} 秒保持健康。",
+                        "stability_verified": True,
+                        "stability_seconds": stability_seconds,
+                        "stability_samples": stability_samples,
+                    })
         except Exception as exc:
             last.update({
                 "status": "unknown",
@@ -7967,8 +8349,18 @@ async def _verify_plan_recovery(
         **last,
         "attempts": attempts + 1,
         "initial_grace_seconds": initial_grace_seconds,
-        "waited_seconds": min(timeout_seconds, initial_grace_seconds + attempts * interval_seconds),
-        "proof": "Pod Ready=true 且未再匹配 CrashLoop/ImagePull/挂载/网络/Pending 等异常证据" if last.get("recovered") else "在验证窗口内未取得恢复证据",
+        "required_stability_seconds": stability_seconds,
+        "waited_seconds": (
+            min(timeout_seconds, initial_grace_seconds + attempts * interval_seconds)
+            + (stability_seconds if last.get("stability_verified") else 0)
+        ),
+        "proof": (
+            f"全部新 Pod Ready、期望副本收敛，且日志/Events 连续 {stability_seconds} 秒无同类异常"
+            if last.get("stability_verified")
+            else "Pod Ready=true 且未再匹配 CrashLoop/ImagePull/挂载/网络/Pending 等异常证据"
+            if last.get("recovered")
+            else "在验证窗口内未取得恢复证据"
+        ),
     }
 
 
@@ -8346,29 +8738,429 @@ def _storage_admin_steps(plan: dict, reason: str = "") -> list[str]:
     ]
 
 
+def _permission_failure_container(plan: dict) -> tuple[dict, str, str]:
+    deep = plan.get("_runtime_evidence") or {}
+    pod = deep.get("pod") or ((plan.get("evidence") or {}).get("pod") or {})
+    logs = deep.get("logs") or {}
+    permission_terms = (
+        "permission denied", "operation not permitted", "read-only file system",
+        "can't create directory", "cannot create directory", "mkdir:",
+    )
+    failing_name = ""
+    for name, content in logs.items():
+        text = json.dumps(content or {}, ensure_ascii=False, default=str).lower()
+        if any(term in text for term in permission_terms):
+            failing_name = str(name)
+            break
+    containers = [
+        item for item in (pod.get("containers") or [])
+        if isinstance(item, dict) and not item.get("is_init")
+    ]
+    container = next((item for item in containers if item.get("name") == failing_name), None)
+    container = container or next(iter(containers), {})
+    failing_name = str(container.get("name") or failing_name or "")
+    text = json.dumps(logs.get(failing_name) or logs, ensure_ascii=False, default=str)
+    path_match = re.search(
+        r"(?:mkdir(?:\s+-p)?|create\s+directory|open)\s*(?::|for)?\s*[\"']?(/[^\s\"']+)",
+        text,
+        flags=re.I,
+    )
+    failing_path = str(path_match.group(1) if path_match else "").rstrip(".,;:")
+    return container, failing_name, failing_path
+
+
+def _permission_attempted_stages(plan: dict) -> set[str]:
+    attempted: set[str] = set()
+    candidates = [
+        *((plan.get("_last_failure") or {}).get("attempted_changes") or []),
+    ]
+    for prior in plan.get("_prior_attempts") or []:
+        if isinstance(prior, dict):
+            candidates.extend(prior.get("changes") or [])
+    for change in candidates:
+        if not isinstance(change, dict):
+            continue
+        if str(change.get("type") or "") == "exec_pod" and "id" in str(change.get("command") or ""):
+            attempted.add("identity_probe")
+        pod_spec = (((change.get("patch") or {}).get("spec") or {}).get("template") or {}).get("spec") or {}
+        if pod_spec.get("initContainers"):
+            attempted.add("init_owner")
+        containers = pod_spec.get("containers") or []
+        if any(((item.get("securityContext") or {}).get("runAsUser") == 0) for item in containers if isinstance(item, dict)):
+            attempted.add("root")
+        elif pod_spec.get("securityContext") or any((item.get("securityContext") for item in containers if isinstance(item, dict))):
+            attempted.add("nonroot_group")
+    return attempted
+
+
+def _permission_recovery_followup(plan: dict) -> dict:
+    namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
+    target = f"{workload_type}/{workload_name}" if workload_name else str(plan.get("target") or namespace)
+    deep = plan.get("_runtime_evidence") or {}
+    pod = deep.get("pod") or ((plan.get("evidence") or {}).get("pod") or {})
+    workload = deep.get("workload") or {}
+    container, container_name, failing_path = _permission_failure_container(plan)
+    attempted = _permission_attempted_stages(plan)
+    pod_sc = pod.get("security_context") or (
+        ((((workload.get("spec") or {}).get("template") or {}).get("spec") or {}).get("securityContext") or {})
+    )
+    container_sc = container.get("security_context") or container.get("securityContext") or {}
+
+    def observed_int(*values) -> int | None:
+        for value in values:
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed >= 0:
+                return parsed
+        return None
+
+    uid = observed_int(container_sc.get("runAsUser"), pod_sc.get("runAsUser"))
+    gid = observed_int(
+        container_sc.get("runAsGroup"),
+        pod_sc.get("runAsGroup"),
+        pod_sc.get("fsGroup"),
+    )
+    configured_uid = os.getenv("AUTO_OPS_DEFAULT_NON_ROOT_UID", "").strip()
+    configured_gid = os.getenv("AUTO_OPS_DEFAULT_NON_ROOT_GID", "").strip()
+    uid = uid if uid is not None else observed_int(configured_uid)
+    gid = gid if gid is not None else observed_int(configured_gid, uid)
+    identity_receipt = json.dumps(
+        (plan.get("_last_failure") or {}).get("change_results") or {},
+        ensure_ascii=False,
+        default=str,
+    )
+    identity_match = re.search(r"uid=(\d+).*?gid=(\d+)", identity_receipt, flags=re.I | re.S)
+    if identity_match:
+        uid = uid if uid is not None else int(identity_match.group(1))
+        gid = gid if gid is not None else int(identity_match.group(2))
+    pod_name = str(deep.get("pod_name") or pod.get("name") or _target_pod_from_plan(plan) or "")
+    change: dict | None = None
+    stage = ""
+
+    if (uid is None or gid is None or uid == 0) and "identity_probe" not in attempted and pod_name and container_name:
+        stage = "identity_probe"
+        change = {
+            "type": "exec_pod",
+            "namespace": namespace,
+            "pod_name": pod_name,
+            "container_name": container_name,
+            "command": "id; grep -E '^(Uid|Gid|Groups):' /proc/1/status",
+            "timeout_seconds": 20,
+            "reason": "模板没有给出可信的非 root UID/GID；先读取目标容器实际身份，再生成最小权限 Patch。",
+            **ACTION_CATALOG["exec_pod"],
+        }
+    elif uid is not None and gid is not None and uid > 0 and "nonroot_group" not in attempted:
+        stage = "nonroot_group"
+        change = {
+            "type": "patch_workload_runtime_security",
+            "namespace": namespace,
+            "workload_type": workload_type,
+            "workload_name": workload_name,
+            "container_name": container_name,
+            "patch": {"spec": {"template": {"spec": {
+                "securityContext": {
+                    "runAsUser": uid,
+                    "runAsGroup": gid,
+                    "runAsNonRoot": True,
+                    "fsGroup": gid,
+                    "supplementalGroups": [gid],
+                    "fsGroupChangePolicy": "OnRootMismatch",
+                },
+                "containers": [{
+                    "name": container_name,
+                    "securityContext": {
+                        "runAsUser": uid,
+                        "runAsGroup": gid,
+                        "runAsNonRoot": True,
+                        "allowPrivilegeEscalation": False,
+                    },
+                }],
+            }}}},
+            "reason": f"已从实时配置确认 UID/GID={uid}:{gid}；先用 fsGroup/组权限恢复，不提升业务容器为 root。",
+            **ACTION_CATALOG["patch_workload_runtime_security"],
+        }
+    else:
+        mount = next(
+            (
+                item for item in (container.get("volume_mounts") or container.get("volumeMounts") or [])
+                if isinstance(item, dict)
+                and item.get("name")
+                and (item.get("mountPath") or item.get("mount_path"))
+                and (
+                    not failing_path
+                    or failing_path.startswith(str(item.get("mountPath") or item.get("mount_path")).rstrip("/") + "/")
+                    or failing_path == (item.get("mountPath") or item.get("mount_path"))
+                )
+            ),
+            None,
+        )
+        init_image = (
+            os.getenv("AUTO_OPS_PERMISSION_INIT_IMAGE", "").strip()
+            or os.getenv("NODE_EXEC_IMAGE", "").strip()
+        )
+        if (
+            "init_owner" not in attempted
+            and uid is not None
+            and gid is not None
+            and uid > 0
+            and mount
+            and init_image
+        ):
+            stage = "init_owner"
+            mount_path = str(mount.get("mountPath") or mount.get("mount_path")).rstrip("/") or "/"
+            bounded_path = failing_path if failing_path.startswith(mount_path) else mount_path
+            change = {
+                "type": "patch_workload_runtime_security",
+                "namespace": namespace,
+                "workload_type": workload_type,
+                "workload_name": workload_name,
+                "container_name": container_name,
+                "patch": {"spec": {"template": {"spec": {
+                    "initContainers": [{
+                        "name": "flawless-volume-permission-init",
+                        "image": init_image,
+                        "command": ["/bin/sh", "-ec"],
+                        "args": [f"mkdir -p -- '{bounded_path}' && chown -R {uid}:{gid} -- '{bounded_path}' && chmod -R ug+rwX -- '{bounded_path}'"],
+                        "securityContext": {
+                            "runAsUser": 0,
+                            "runAsGroup": 0,
+                            "runAsNonRoot": False,
+                            "allowPrivilegeEscalation": False,
+                            "readOnlyRootFilesystem": False,
+                            "capabilities": {"drop": ["ALL"], "add": ["CHOWN", "FOWNER", "DAC_OVERRIDE"]},
+                        },
+                        "volumeMounts": [{
+                            "name": mount["name"],
+                            "mountPath": mount_path,
+                            **({
+                                "subPath": mount.get("subPath") or mount.get("sub_path")
+                            } if mount.get("subPath") or mount.get("sub_path") else {}),
+                        }],
+                    }],
+                    "securityContext": {
+                        "runAsUser": uid,
+                        "runAsGroup": gid,
+                        "runAsNonRoot": True,
+                        "fsGroup": gid,
+                        "supplementalGroups": [gid],
+                        "fsGroupChangePolicy": "OnRootMismatch",
+                    },
+                    "containers": [{
+                        "name": container_name,
+                        "securityContext": {
+                            "runAsUser": uid,
+                            "runAsGroup": gid,
+                            "runAsNonRoot": True,
+                            "allowPrivilegeEscalation": False,
+                        },
+                    }],
+                }}}},
+                "reason": f"非 root 组权限未恢复；仅用一次性 root initContainer 修复已证实路径 {bounded_path}，业务容器仍以 {uid}:{gid} 运行。",
+                **ACTION_CATALOG["patch_workload_runtime_security"],
+            }
+        elif "root" not in attempted and container_name:
+            stage = "root"
+            change = {
+                "type": "patch_workload_runtime_security",
+                "namespace": namespace,
+                "workload_type": workload_type,
+                "workload_name": workload_name,
+                "container_name": container_name,
+                "patch": {"spec": {"template": {"spec": {
+                    "securityContext": {
+                        "runAsUser": 0,
+                        "runAsGroup": 0,
+                        "runAsNonRoot": False,
+                        "fsGroup": 0,
+                        "supplementalGroups": [0],
+                        "fsGroupChangePolicy": "OnRootMismatch",
+                    },
+                    "containers": [{
+                        "name": container_name,
+                        "securityContext": {
+                            "runAsUser": 0,
+                            "runAsGroup": 0,
+                            "runAsNonRoot": False,
+                            "allowPrivilegeEscalation": False,
+                        },
+                    }],
+                }}}},
+                "reason": "非 root 与有界目录修复均未恢复；仅把实际失败容器及必要 Pod 组提升为 0，其他容器保持原配置。",
+                **ACTION_CATALOG["patch_workload_runtime_security"],
+            }
+
+    if not change:
+        steps = _storage_admin_steps(plan, "所有受控权限阶段均已尝试，仍未得到恢复证据；需要存储或安全管理员处理底层边界。")
+        return {
+            "id": f"permission-admin-{uuid.uuid4().hex[:8]}",
+            "title": "权限恢复升级：管理员处理底层存储边界",
+            "namespace": namespace,
+            "target": target,
+            "summary": "受控非 root、目录修复与 root 恢复均未闭环；不再重复相同变更。",
+            "steps": [{"title": f"管理员步骤 {index + 1}", "description": text, "status": "manual"} for index, text in enumerate(steps)],
+            "changes": [],
+            "operator_steps": steps,
+            "source": "storage_admin_required",
+            "verification_plan": _next_attempt_verification_plan(target),
+        }
+    if (
+        str(workload_type or "").lower() in {"pod", "job"}
+        and change.get("type") == "patch_workload_runtime_security"
+    ):
+        change.update({
+            "type": "replace_immutable_workload",
+            "kind": "Pod" if str(workload_type).lower() == "pod" else "Job",
+            "name": workload_name or pod_name,
+            **ACTION_CATALOG["replace_immutable_workload"],
+        })
+    return {
+        "id": f"permission-{stage}-{uuid.uuid4().hex[:8]}",
+        "title": f"权限恢复阶段：{stage}",
+        "namespace": namespace,
+        "target": target,
+        "pod_name": pod_name,
+        "summary": change["reason"],
+        "steps": [
+            {"title": "确认实时证据", "description": "核对失败容器、实际 UID/GID、挂载路径和上一轮验证结果。", "status": "pending"},
+            {"title": "执行单阶段变更", "description": "本轮只执行一个权限阶段，变更后滚动创建新 Pod。", "status": "pending"},
+            {"title": "持续恢复验证", "description": "连续验证 Ready/副本/Events/日志，失败则基于新证据进入下一阶段。", "status": "pending"},
+        ],
+        "changes": [change],
+        "permission_recovery_stage": stage,
+        "requires_confirmation": True,
+        "requires_high_risk_confirmation": True,
+        "source": "progressive_permission_recovery",
+        "verification_plan": _next_attempt_verification_plan(target),
+    }
+
+
+def _permission_hardening_plan(plan: dict) -> dict | None:
+    """Build the separately approved non-root hardening attempt after root recovery."""
+    if str(plan.get("permission_recovery_stage") or "") != "root":
+        return None
+    namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
+    container_name = str(((plan.get("changes") or [{}])[0]).get("container_name") or "")
+    historical = [
+        *((plan.get("_last_failure") or {}).get("attempted_changes") or []),
+    ]
+    uid = gid = None
+    for prior in historical:
+        if not isinstance(prior, dict):
+            continue
+        pod_spec = (((prior.get("patch") or {}).get("spec") or {}).get("template") or {}).get("spec") or {}
+        for item in pod_spec.get("containers") or []:
+            sc = (item or {}).get("securityContext") or {}
+            if sc.get("runAsUser") not in {None, 0}:
+                uid = int(sc["runAsUser"])
+                gid = int(sc.get("runAsGroup") or ((pod_spec.get("securityContext") or {}).get("fsGroup") or uid))
+                container_name = container_name or str(item.get("name") or "")
+                break
+        if uid is not None:
+            break
+    if uid is None:
+        try:
+            uid = int(os.getenv("AUTO_OPS_DEFAULT_NON_ROOT_UID", ""))
+            gid = int(os.getenv("AUTO_OPS_DEFAULT_NON_ROOT_GID", "") or uid)
+        except (TypeError, ValueError):
+            return None
+    if uid <= 0 or gid is None or gid < 0 or not container_name:
+        return None
+    nonroot_patch = {"spec": {"template": {"spec": {
+        "securityContext": {
+            "runAsUser": uid,
+            "runAsGroup": gid,
+            "runAsNonRoot": True,
+            "fsGroup": gid,
+            "supplementalGroups": [gid],
+            "fsGroupChangePolicy": "OnRootMismatch",
+        },
+        "containers": [{
+            "name": container_name,
+            "securityContext": {
+                "runAsUser": uid,
+                "runAsGroup": gid,
+                "runAsNonRoot": True,
+                "allowPrivilegeEscalation": False,
+            },
+        }],
+    }}}}
+    root_patch = copy.deepcopy((plan.get("changes") or [{}])[0].get("patch") or {})
+    if not root_patch:
+        return None
+    change = {
+        "type": "patch_workload_runtime_security",
+        "namespace": namespace,
+        "workload_type": workload_type,
+        "workload_name": workload_name,
+        "container_name": container_name,
+        "patch": nonroot_patch,
+        "reason": (
+            f"root 状态已验证恢复；单独审批后尝试恢复为非 root {uid}:{gid}。"
+            "若持续验证失败，系统按本次审批中展示的回滚补丁自动恢复到已验证 root 状态。"
+        ),
+        "automatic_rollback": True,
+        "rollback_patch": root_patch,
+        **ACTION_CATALOG["patch_workload_runtime_security"],
+    }
+    immutable = str(workload_type or "").lower() in {"pod", "job"}
+    if immutable:
+        change.update({
+            "type": "replace_immutable_workload",
+            "kind": "Pod" if str(workload_type).lower() == "pod" else "Job",
+            "name": workload_name or plan.get("pod_name"),
+            **ACTION_CATALOG["replace_immutable_workload"],
+        })
+    rollback_type = "replace_immutable_workload" if immutable else "patch_workload_runtime_security"
+    return {
+        "id": f"permission-hardening-{uuid.uuid4().hex[:8]}",
+        "title": "权限恢复后的非 root 加固",
+        "namespace": namespace,
+        "target": f"{workload_type}/{workload_name}",
+        "cluster": plan.get("cluster"),
+        "cluster_id": plan.get("cluster_id"),
+        "source": plan.get("source"),
+        "pod_name": plan.get("pod_name"),
+        "summary": change["reason"],
+        "steps": [
+            {"title": "确认 root 恢复基线", "description": "保存已验证 root 补丁与恢复证据作为自动回滚点。", "status": "pending"},
+            {"title": "尝试非 root 加固", "description": f"只调整故障容器为 {uid}:{gid} 并保留最小组权限。", "status": "pending"},
+            {"title": "持续验证或回滚", "description": "加固失败会自动恢复已批准的 root 基线，并再次验证。", "status": "pending"},
+        ],
+        "changes": [change],
+        "permission_recovery_stage": "nonroot_hardening",
+        "rollback_change": {
+            "type": rollback_type,
+            "namespace": namespace,
+            "workload_type": workload_type,
+            "workload_name": workload_name,
+            **({
+                "kind": "Pod" if str(workload_type).lower() == "pod" else "Job",
+                "name": workload_name or plan.get("pod_name"),
+            } if immutable else {}),
+            "container_name": container_name,
+            "patch": root_patch,
+            "reason": "非 root 加固未通过持续验证，恢复到此前已验证的 root 基线。",
+            "rollback_operation": True,
+            **ACTION_CATALOG[rollback_type],
+        },
+        "requires_confirmation": True,
+        "requires_high_risk_confirmation": True,
+        "stepwise_confirmation": True,
+        "high_risk_confirmed": False,
+        "operator_force_execute": False,
+        "success_criteria": plan.get("success_criteria") or [],
+        "verification_plan": _next_attempt_verification_plan(f"{workload_type}/{workload_name}"),
+    }
+
+
 def _derive_followup_plans(plan: dict, summary_text: str) -> list[dict]:
     if not _storage_permission_detected(plan, summary_text):
         return []
-
-    namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
-    target = f"{workload_type}/{workload_name}" if workload_name else str(plan.get("target") or namespace)
-    operator_steps = _storage_admin_steps(
-        plan,
-        "当前没有得到新的、可授权具体变更的证据；请补齐后重新触发动态 Skill 规划。",
-    )
-    return [{
-        "id": f"followup-storage-evidence-{uuid.uuid4().hex[:8]}",
-        "title": "重新取证并动态匹配权限恢复 Skill",
-        "namespace": namespace,
-        "target": target,
-        "summary": "上一轮没有恢复。系统不会自动切换到固定 fsGroup/initContainer 链，而是要求基于失败后新 Pod 证据生成差异化方案。",
-        "steps": [{"title": "补齐差异证据", "description": item, "status": "manual"} for item in operator_steps],
-        "changes": [],
-        "requires_confirmation": False,
-        "source": "dynamic_skill_evidence_required",
-        "operator_steps": operator_steps,
-        "verification_plan": _next_attempt_verification_plan(target),
-    }]
+    return [_permission_recovery_followup(plan)]
 
 
 def _normalize_planner_change(raw: dict, plan: dict) -> tuple[dict | None, str]:
@@ -8447,6 +9239,20 @@ def _normalize_planner_change(raw: dict, plan: dict) -> tuple[dict | None, str]:
         return change, ""
     if action in {"patch_workload", "patch_workload_volume", "patch_workload_runtime_security", "restart", "scale_out"} and not change.get("workload_name"):
         return None, f"{action} requires workload_name"
+    if action == "replace_immutable_workload":
+        kind = str(change.get("kind") or change.get("workload_type") or "")
+        name = str(change.get("name") or change.get("workload_name") or change.get("pod_name") or "")
+        if kind.lower() not in {"pod", "job"} or not name:
+            return None, "replace_immutable_workload requires kind=Pod|Job and an exact name"
+        valid, reason = _validate_workload_patch(
+            change.get("patch") or {},
+            allow_init_containers=True,
+        )
+        if not valid:
+            return None, f"immutable replacement patch rejected: {reason}"
+        change["kind"] = "Pod" if kind.lower() == "pod" else "Job"
+        change["name"] = name
+        return change, ""
     if action in {"patch_workload", "patch_workload_volume", "patch_workload_runtime_security"}:
         valid, reason = _validate_workload_patch(
             change.get("patch") or {},
@@ -8550,6 +9356,18 @@ async def _evidence_based_replan(
         "evidence_gap": engine_plan.get("evidence_gap"),
         "success_criteria": engine_plan.get("success_criteria") or [],
     }
+    if (
+        str(engine_plan.get("runbook_id") or "") == "storage_permission"
+        and _storage_permission_detected(plan, engine_plan.get("reason") or "")
+    ):
+        progressive = _permission_recovery_followup(plan)
+        plan["_runtime_replan"]["planning"] = {
+            "source": "ProgressivePermissionRecovery/v1",
+            "accepted_changes": len(progressive.get("changes") or []),
+            "stage": progressive.get("permission_recovery_stage") or "administrator_boundary",
+            "rejected_candidates": [],
+        }
+        return [progressive]
     candidates = list(engine_plan.get("changes") or [])
     planner_meta: dict = {"source": "EvidenceRunbookEngine", "hypotheses": engine_plan.get("hypotheses", [])}
 
@@ -8572,7 +9390,7 @@ async def _evidence_based_replan(
                 plan=plan,
             ), top_k=3)
             prompt = (
-                "你是 Kubernetes 故障修复规划器。根据真实执行证据和动态匹配 Skill，从给定动作目录中选择至多两个结构化动作。"
+                "你是 Kubernetes 故障修复规划器。根据真实执行证据和动态匹配 Skill，从给定动作目录中只选择一个结构化动作。"
                 "证据不足时 changes=[]。高风险动作可以提出但必须标 risk=high，所有动作都必须人工审批。"
                 "上一轮方案已经执行且恢复验证失败；不得只改写理由后重复相同动作、目标和参数。只有参数发生实质变化且新证据明确支持时，"
                 "才允许继续使用同一动作类型，否则必须换根因假设、换动作，或明确进入管理员人工处理。"
@@ -8614,7 +9432,7 @@ async def _evidence_based_replan(
     seen = set()
     constrained_actions = {
         "storage_mount": {"create_pvc", "create_pv", "expand_pvc", "patch_workload_volume"},
-        "storage_permission": {"patch_workload", "patch_workload_runtime_security", "patch_resource", "apply_manifest", "exec_pod", "exec_node"},
+        "storage_permission": {"patch_workload", "patch_workload_runtime_security", "replace_immutable_workload", "patch_resource", "apply_manifest", "exec_pod", "exec_node"},
         "config_missing": {"create_configmap"},
         "image_auth": {"patch_workload", "patch_service_account", "rollback_workload"},
         "image_architecture": {"rollback_workload", "patch_workload"},
@@ -8662,9 +9480,9 @@ async def _evidence_based_replan(
         "evidence": plan.get("evidence") or {},
         "summary": planner_meta.get("reason") or engine_plan.get("reason") or "根据新证据生成差异化修复策略。",
         "steps": engine_plan.get("steps") or [],
-        "changes": normalized[:2],
+        "changes": normalized[:1],
         "requires_confirmation": True,
-        "requires_high_risk_confirmation": any(change.get("risk") == "high" for change in normalized[:2]),
+        "requires_high_risk_confirmation": any(change.get("risk") == "high" for change in normalized[:1]),
         "strategy_source": "evidence_replan",
         "planning": planner_meta,
         "root_cause_hypotheses": engine_plan.get("hypotheses", []),
@@ -8692,7 +9510,7 @@ def _preflight_evidence_conflict(plan: dict) -> bool:
         return False
     allowed = {
         "storage_mount": {"create_pvc", "create_pv", "expand_pvc", "patch_workload_volume"},
-        "storage_permission": {"patch_workload", "patch_workload_runtime_security", "patch_resource", "apply_manifest", "exec_pod", "exec_node"},
+        "storage_permission": {"patch_workload", "patch_workload_runtime_security", "replace_immutable_workload", "patch_resource", "apply_manifest", "exec_pod", "exec_node"},
         "config_missing": {"create_configmap"},
         "image_auth": {"patch_workload", "patch_service_account", "rollback_workload"},
         "image_architecture": {"rollback_workload", "patch_workload"},
@@ -9182,6 +10000,8 @@ async def _execute_ops_plan_once(
     except Exception as exc:
         plan["_runtime_evidence"] = {"error": f"{type(exc).__name__}: {_redact_text(str(exc))}"}
     deep_evidence = plan.get("_runtime_evidence") or {}
+    if not deep_evidence.get("error"):
+        plan["_audit_before_snapshot"] = _ops_evidence_snapshot(deep_evidence)
     evidence_summary = {
         "status": "warning" if deep_evidence.get("error") else "completed",
         "logs": len(deep_evidence.get("logs") or {}),
@@ -9397,6 +10217,7 @@ async def _execute_ops_plan_once(
         }
 
     results = []
+    executed_skill_ids: set[str] = set()
     changes = [change if isinstance(change, dict) else {"type": str(change)} for change in plan.get("changes", [])]
     for index, change in enumerate(changes, start=1):
         if cancel_event and cancel_event.is_set():
@@ -9415,6 +10236,12 @@ async def _execute_ops_plan_once(
                 }
             change["human_approved"] = True
             change["operator_confirmed"] = True
+        execution_skill_id = str(change.get("skill_id") or plan.get("selected_skill_id") or "")
+        if execution_skill_id and execution_skill_id not in executed_skill_ids:
+            OPS_SKILL_REGISTRY.record_usage(execution_skill_id, "executed")
+            executed_skill_ids.add(execution_skill_id)
+        if execution_skill_id and str(change.get("type") or "") in {"rollback_workload", "rollback_permission_hardening"}:
+            OPS_SKILL_REGISTRY.record_usage(execution_skill_id, "rolled_back")
         await emit(
             "change_start",
             f"提交变更：{change.get('type', 'change')} -> {change_target}",
@@ -9618,6 +10445,67 @@ async def _execute_ops_plan_once(
         verification=verification,
         level="success" if verification.get("recovered") is True else "warning",
     )
+    if (
+        verification.get("recovered") is not True
+        and str(plan.get("permission_recovery_stage") or "") == "nonroot_hardening"
+        and isinstance(plan.get("rollback_change"), dict)
+        and not (cancel_event and cancel_event.is_set())
+    ):
+        rollback_change = copy.deepcopy(plan["rollback_change"])
+        rollback_change["human_approved"] = True
+        rollback_change["operator_confirmed"] = True
+        rollback_change["skill_id"] = rollback_change.get("skill_id") or plan.get("selected_skill_id")
+        await emit(
+            "hardening_rollback",
+            "非 root 加固未通过持续验证；按本次加固审批中展示的回滚补丁恢复已验证 root 基线。",
+            rollback_patch=rollback_change.get("patch") or {},
+            level="warning",
+        )
+        rollback_result = await _execute_change(rollback_change, plan)
+        results.append(rollback_result)
+        rollback_skill_id = str(rollback_change.get("skill_id") or "")
+        if rollback_skill_id:
+            OPS_SKILL_REGISTRY.record_usage(rollback_skill_id, "rolled_back")
+        rollback_plan = {
+            **copy.deepcopy(plan),
+            "changes": [rollback_change],
+            "permission_recovery_stage": "root_rollback",
+        }
+        rollback_verification = await _verify_plan_recovery(rollback_plan, [rollback_result], cancel_event)
+        rollback_verification["hardening_succeeded"] = False
+        rollback_verification["hardening_rolled_back"] = rollback_verification.get("recovered") is True
+        rollback_verification["residual_risk"] = (
+            "业务容器仍需 root 才能写入目标卷；已恢复服务，但需存储/镜像负责人后续消除 root 依赖。"
+        )
+        await emit(
+            "hardening_rollback_verified",
+            (
+                "非 root 加固失败，已自动回滚并验证 root 恢复基线。"
+                if rollback_verification.get("recovered") is True
+                else "非 root 加固失败，root 回滚也未取得恢复证据；故障保持打开并继续生成方案。"
+            ),
+            verification=rollback_verification,
+            level="success" if rollback_verification.get("recovered") is True else "error",
+        )
+        verification = rollback_verification
+        if rollback_verification.get("recovered") is True:
+            next_steps = _ops_terminal_next_steps(plan, rollback_verification)
+            return {
+                "status": "completed",
+                "executed": True,
+                "steps": executed_steps,
+                "changes": plan.get("changes") or [],
+                "results": results,
+                "release_gate": release_gate,
+                "verification": rollback_verification,
+                "before_snapshot": plan.get("_audit_before_snapshot") or {},
+                "alternative_plans": [],
+                "operator_steps": [
+                    "服务已在 root 回滚基线恢复；请安排存储目录属主、镜像 UID/GID 或 CSI 挂载策略整改。",
+                ],
+                "next_steps": next_steps,
+                "message": "非 root 加固未成功，系统已自动回滚到验证通过的 root 状态。",
+            }
     if verification.get("recovered") is not True:
         current_change_fingerprints = {
             _change_item_fingerprint(change)
@@ -9764,6 +10652,12 @@ async def _execute_ops_plan_once(
         "results": results,
         "release_gate": release_gate,
         "verification": verification,
+        "before_snapshot": plan.get("_audit_before_snapshot") or {},
+        "skill_routing_record": {
+            "mode": plan.get("skill_execution_mode"),
+            "selected_skill_id": plan.get("selected_skill_id"),
+            "candidates": plan.get("skill_candidates") or plan.get("operator_skills") or [],
+        },
         "alternative_plans": alternative_plans,
         "ai_summary": ai_summary,
         "next_steps": next_steps,
@@ -9848,6 +10742,8 @@ def _public_skill_match(match: dict) -> dict:
         "risk": skill.get("risk"),
         "confidence": match.get("confidence"),
         "score": match.get("score"),
+        "rank": match.get("rank"),
+        "score_breakdown": match.get("score_breakdown") or {},
         "why": match.get("why"),
         "allowed_actions": skill.get("allowed_actions") or [],
         "evidence_required": skill.get("evidence_required") or [],
@@ -10021,8 +10917,15 @@ def _attach_operator_skills_to_plan(
     if not isinstance(plan, dict):
         return plan
     _enrich_plan_change_policies(plan)
-    result = OPS_SKILL_REGISTRY.match(signal, top_k=top_k)
-    matches = [item for item in result.get("matches") or [] if float(item.get("confidence") or 0) >= 0.28]
+    result = OPS_SKILL_REGISTRY.match(signal, top_k=max(5, top_k))
+    attempted_skill_ids = {
+        str(item) for item in (plan.get("_attempted_skill_ids") or []) if str(item)
+    }
+    matches = [
+        item for item in result.get("matches") or []
+        if float(item.get("confidence") or 0) > 0
+        and str((item.get("skill") or {}).get("id") or "") not in attempted_skill_ids
+    ]
     preferred_skill_ids = [str(item) for item in preferred_skill_ids or [] if str(item)]
     if preferred_skill_ids:
         by_id = {str((item.get("skill") or {}).get("id")): item for item in matches}
@@ -10034,6 +10937,7 @@ def _attach_operator_skills_to_plan(
                     "skill": skill,
                     "score": max(0.3, 0.9 - index * 0.08),
                     "confidence": max(0.55, 0.92 - index * 0.08),
+                    "score_breakdown": {"router_preference": True},
                     "why": "批量 Skill Router 根据异常证据与适用对象选择。",
                 }
         matches = sorted(
@@ -10043,7 +10947,13 @@ def _attach_operator_skills_to_plan(
                 if str((item.get("skill") or {}).get("id")) in preferred_skill_ids else len(preferred_skill_ids),
                 -float(item.get("confidence") or 0),
             ),
-        )[:top_k]
+        )[:max(5, top_k)]
+    matches = matches[:max(5, top_k)]
+    for index, match in enumerate(matches, start=1):
+        match["rank"] = index
+        skill_id = str((match.get("skill") or {}).get("id") or "")
+        if skill_id:
+            OPS_SKILL_REGISTRY.record_usage(skill_id, "matched")
     if not matches:
         plan.setdefault("operator_skills", [])
         if plan.get("changes") and _env_bool("SKILL_EXECUTION_REQUIRED", "true"):
@@ -10060,7 +10970,17 @@ def _attach_operator_skills_to_plan(
         match["_evidence_collected"] = [item for item in required if item in collected_evidence]
         match["_evidence_missing"] = missing
         match["_execution_authorized"] = bool(skill.get("execution_ready")) and not missing
+    active_match = matches[0]
+    active_skill = active_match.get("skill") or {}
+    active_skill_id = str(active_skill.get("id") or "")
+    active_confidence = float(active_match.get("confidence") or 0)
     plan["operator_skills"] = [_public_skill_match(item) for item in matches]
+    plan["skill_candidates"] = copy.deepcopy(plan["operator_skills"])
+    plan["selected_skill_id"] = active_skill_id
+    plan["skill_execution_mode"] = "adaptive_serial"
+    plan["skill_execution_threshold"] = float(result.get("execution_threshold") or 0.70)
+    if active_skill_id:
+        OPS_SKILL_REGISTRY.record_usage(active_skill_id, "selected")
     plan["skill_evidence"] = {
         "collected": sorted(collected_evidence),
         "missing_by_skill": {
@@ -10071,18 +10991,27 @@ def _attach_operator_skills_to_plan(
     }
     existing_step_ids = {str(step.get("id") or step.get("title")) for step in plan.get("steps") or [] if isinstance(step, dict)}
     skill_steps = [
-        step for step in OPS_SKILL_REGISTRY.steps_from_matches(matches, limit=2)
+        step for step in OPS_SKILL_REGISTRY.steps_from_matches([active_match], limit=1)
         if str(step.get("id") or step.get("title")) not in existing_step_ids
     ]
     if skill_steps:
-        plan["skill_suggested_steps"] = skill_steps[:6]
+        plan["skill_suggested_steps"] = skill_steps[:3]
     criteria = list(plan.get("success_criteria") or [])
-    for match in matches[:2]:
-        for item in ((match.get("skill") or {}).get("success_criteria") or []):
-            if item not in criteria:
-                criteria.append(item)
+    for item in (active_skill.get("success_criteria") or []):
+        if item not in criteria:
+            criteria.append(item)
     plan["success_criteria"] = criteria
-    execution_matches = [match for match in matches if match.get("_execution_authorized")]
+    execution_matches = [active_match] if active_match.get("_execution_authorized") else []
+    if active_confidence < float(result.get("execution_threshold") or 0.70):
+        execution_matches = []
+        if plan.get("changes"):
+            plan["_blocked_low_confidence_changes"] = copy.deepcopy(plan.get("changes") or [])
+            plan["changes"] = []
+        plan["decision"] = "diagnostic_skill_then_rerank"
+        plan["evidence_gap"] = (
+            f"最高匹配 Skill 置信度 {active_confidence:.0%} 低于 70%；"
+            "本轮只执行该 Skill 的只读诊断步骤，取得新证据后重新排序。"
+        )
     actions = sorted({
         action
         for match in execution_matches
@@ -10091,22 +11020,12 @@ def _attach_operator_skills_to_plan(
     })
     if actions:
         plan["skill_allowed_actions"] = actions
-        owners = [
-            str((match.get("skill") or {}).get("id"))
-            for match in execution_matches
-        ]
+        owners = [active_skill_id]
         for change in plan.get("changes") or []:
             change["skill_supported"] = str(change.get("type") or "") in actions
             change["selection_source"] = "matched_skill" if change["skill_supported"] else "evidence_engine_fallback"
             if change["skill_supported"]:
-                change["skill_id"] = next(
-                    (
-                        str((match.get("skill") or {}).get("id"))
-                        for match in execution_matches
-                        if str(change.get("type") or "") in ((match.get("skill") or {}).get("allowed_actions") or [])
-                    ),
-                    owners[0] if owners else "",
-                )
+                change["skill_id"] = active_skill_id or (owners[0] if owners else "")
         supported_changes = [change for change in plan.get("changes") or [] if change.get("skill_supported")]
         if supported_changes:
             plan["changes"] = supported_changes
@@ -10141,7 +11060,7 @@ def _attach_operator_skills_to_plan(
         )
     script_candidates = []
     approved_scripts = {item["id"]: item for item in approved_script_catalog() if item.get("enabled", True)}
-    for match in matches[:2]:
+    for match in [active_match]:
         skill = match.get("skill") or {}
         policy = skill.get("script_policy") or {}
         script = approved_scripts.get(str(policy.get("script_id") or ""))
@@ -10164,8 +11083,11 @@ def _attach_operator_skills_to_plan(
         plan["skill_script_candidates"] = script_candidates
     if routing:
         plan["skill_routing"] = _redact_sensitive(routing)
-    plan["planning_engine"] = "DynamicSREPlanner/v4 + ExecutableSkillRouter/v3 (AgentSkillRouter/v2 compatible) + SkillMemory + ApprovalGate"
-    plan["skill_match_policy"] = "AI 基于实时证据生成方案；动态匹配 Skill 校验证据、授权动作并定义恢复判据；任何变更仍需人工审批。"
+    plan["planning_engine"] = "DynamicSREPlanner/v5 + AdaptiveSerialSkillRouter/v1 (AgentSkillRouter/v2 compatible) + SkillMemory + ApprovalGate"
+    plan["skill_match_policy"] = (
+        "候选 Skill 按 40/20/20/10/10 加权排序；同一时刻只允许最高分 Skill 执行，"
+        "低于 70% 先只读取证后重排，失败后排除已失败 Skill 并基于新证据选择下一项。"
+    )
     return plan
 
 
@@ -10424,6 +11346,80 @@ async def _route_inspection_findings_with_skills(payload: dict, model_profile_id
 
 async def list_ops_skills():
     return OPS_SKILL_REGISTRY.list()
+
+
+async def ops_skill_stats():
+    return OPS_SKILL_REGISTRY.usage_stats()
+
+
+def _ops_record_matches(job: dict, filters: dict[str, str]) -> bool:
+    for key in ("cluster", "namespace", "status"):
+        expected = filters.get(key, "").strip()
+        if expected and expected != "all" and str(job.get(key) or "") != expected:
+            return False
+    skill_id = filters.get("skill_id", "").strip()
+    if skill_id:
+        plan = job.get("plan") or {}
+        ids = {
+            str(plan.get("selected_skill_id") or ""),
+            *{
+                str(item.get("skill_id") or "")
+                for item in job.get("history") or []
+                if isinstance(item, dict)
+            },
+        }
+        if skill_id not in ids:
+            return False
+    return True
+
+
+async def list_ops_records(request: Request):
+    params = request.query_params
+    limit = max(1, min(1000, int(params.get("limit") or 200)))
+    filters = {
+        "cluster": params.get("cluster") or "",
+        "namespace": params.get("namespace") or "",
+        "status": params.get("status") or "",
+        "skill_id": params.get("skill_id") or "",
+    }
+    items = [
+        _public_ops_job(job)
+        for job in reversed(list(OPS_JOBS.values()))
+        if _ops_record_matches(job, filters)
+    ][:limit]
+    return {
+        "status": "ok",
+        "retention_days": max(1, int(os.getenv("OPS_RECORD_RETENTION_DAYS", "365"))),
+        "total": len(items),
+        "items": items,
+        "skill_stats": OPS_SKILL_REGISTRY.usage_stats(),
+    }
+
+
+async def export_ops_records(request: Request):
+    payload = await list_ops_records(request)
+    content = json.dumps(_redact_sensitive(payload), ensure_ascii=False, indent=2, default=str).encode("utf-8")
+    return StreamingResponse(
+        iter([content]),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": "attachment; filename=flawless-ops-records.json",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+async def delete_ops_record(job_id: str, request: Request):
+    async with OPS_JOBS_LOCK:
+        job = OPS_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="运维记录不存在")
+        if job.get("status") in {"queued", "running", "awaiting_approval", "cancelling", "resume_pending"}:
+            raise HTTPException(status_code=409, detail="运行中的运维任务不能删除，请先中断并等待终态")
+        OPS_JOBS.pop(job_id, None)
+        _persist_ops_jobs()
+    _safe_audit_event("aiops.record.delete", _request_actor(request), job_id, "accepted")
+    return {"status": "deleted", "id": job_id}
 
 
 async def import_ops_skill_package(request: Request, file: UploadFile = File(...)):
@@ -10912,6 +11908,8 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
             "risk": change.get("risk") or "medium",
             "reason": change.get("reason") or "等待操作员核对本步骤。",
             "rollback": change.get("rollback") or "按变更前快照恢复。",
+            "automatic_rollback": bool(change.get("automatic_rollback")),
+            "rollback_patch": change.get("rollback_patch"),
             "patch": change.get("patch"),
             "manifest": change.get("manifest"),
             "command": change.get("command"),
@@ -10924,6 +11922,9 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
             "kind": change.get("kind"),
             "name": change.get("name"),
         }
+        approval_skill_id = str(change.get("skill_id") or current.get("selected_skill_id") or "")
+        if approval_skill_id:
+            OPS_SKILL_REGISTRY.record_usage(approval_skill_id, "approval_requested")
         await _append_ops_job_event(
             job_id,
             "awaiting_change_approval",
@@ -11041,6 +12042,7 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
             history.append({
                 "attempt": attempt,
                 "strategy": current.get("title") or current.get("source") or "ops-plan",
+                "skill_id": current.get("selected_skill_id") or "",
                 "fingerprint": fingerprint,
                 "actions": sorted(_plan_action_types(current)),
                 "change_fingerprints": [
@@ -11054,6 +12056,21 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
             result = _attach_ops_continuation_context(job_id, current, result, attempted, history)
             history[-1]["result"] = result
             await _update_ops_job(job_id, history=history, result=result)
+            active_skill_id = str(current.get("selected_skill_id") or "")
+            skill_was_executed = bool(result.get("results"))
+            if (
+                active_skill_id
+                and skill_was_executed
+                and not (
+                    result.get("status") == "completed"
+                    and (result.get("verification") or {}).get("recovered") is True
+                )
+            ):
+                OPS_SKILL_REGISTRY.record_usage(active_skill_id, "failed")
+                current["_attempted_skill_ids"] = sorted({
+                    *{str(item) for item in (current.get("_attempted_skill_ids") or []) if str(item)},
+                    active_skill_id,
+                })
             if result.get("status") == "cancelled" or cancel_event.is_set():
                 result = _ensure_effectiveness_record(current, result)
                 await _update_ops_job(job_id, result=result)
@@ -11146,6 +12163,54 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
                 await _update_ops_job(job_id, plan=copy.deepcopy(current))
                 continue
             if result.get("status") == "completed" and (result.get("verification") or {}).get("recovered") is True:
+                if str(current.get("permission_recovery_stage") or "") == "root":
+                    hardening = _permission_hardening_plan(current)
+                    if hardening:
+                        hardening = _attach_operator_skills_to_plan(
+                            hardening,
+                            _skill_signal_payload(
+                                question=hardening.get("summary") or "",
+                                alert={
+                                    "cluster": current.get("cluster"),
+                                    "cluster_id": current.get("cluster_id"),
+                                    "namespace": current.get("namespace"),
+                                    "target": current.get("target"),
+                                },
+                                diagnosis={
+                                    "root_cause": "root 状态已恢复，尝试最小权限加固",
+                                    "signals": (current.get("_runtime_evidence") or {}).get("events") or [],
+                                },
+                                evidence=current.get("_runtime_evidence") or current.get("evidence") or {},
+                                plan=hardening,
+                            ),
+                            preferred_skill_ids=[str(current.get("selected_skill_id") or "skill-volume-permission-recovery")],
+                        )
+                        hardening["high_risk_confirmed"] = False
+                        hardening["operator_force_execute"] = False
+                        hardening["stepwise_confirmation"] = True
+                        hardening["_last_failure"] = copy.deepcopy(current.get("_last_failure") or {})
+                        hardening["_attempted_skill_ids"] = copy.deepcopy(current.get("_attempted_skill_ids") or [])
+                        hardening["_prior_attempts"] = copy.deepcopy(current.get("_prior_attempts") or [])
+                        await _append_ops_job_event(
+                            job_id,
+                            "root_recovered_hardening_proposed",
+                            "root 恢复已连续验证通过；已生成单独审批的非 root 加固方案，失败会按审批中展示的补丁自动回滚。",
+                            status="running",
+                            root_recovery_verification=result.get("verification") or {},
+                            residual_risk="当前业务容器以 root 运行，等待操作员决定是否尝试非 root 加固。",
+                            level="warning",
+                        )
+                        current = hardening
+                        await _update_ops_job(job_id, plan=copy.deepcopy(current))
+                        continue
+                    result.setdefault("verification", {})["residual_risk"] = (
+                        "业务已在 root 状态恢复，但缺少可信的原非 root UID/GID，无法自动生成安全加固补丁。"
+                    )
+                if active_skill_id and skill_was_executed:
+                    if (result.get("verification") or {}).get("hardening_succeeded") is False:
+                        OPS_SKILL_REGISTRY.record_usage(active_skill_id, "failed")
+                    else:
+                        OPS_SKILL_REGISTRY.record_usage(active_skill_id, "succeeded")
                 await _append_ops_job_event(job_id, "summarizing", "生成恢复结论和验证证据", status="running")
                 result["ai_summary"] = await _llm_ops_summary(current, result.get("steps") or [], result.get("results") or [])
                 result = _ensure_effectiveness_record(current, result)
@@ -11223,6 +12288,12 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
                 ][-12:],
                 "_prior_attempt_count": int((result.get("continuation_context") or {}).get("attempt_count") or 0),
                 "_attempted_actions": sorted(_history_action_types(history) | _plan_action_types(previous_current)),
+                "_attempted_skill_ids": sorted({
+                    *{str(item) for item in (previous_current.get("_attempted_skill_ids") or []) if str(item)},
+                    *({
+                        str(previous_current.get("selected_skill_id"))
+                    } if previous_current.get("selected_skill_id") and skill_was_executed else set()),
+                }),
                 "_attempted_strategy_fingerprints": sorted(attempted),
                 "_attempted_change_fingerprints": sorted(
                     _history_change_fingerprints(history)
@@ -12140,6 +13211,7 @@ async def mcp_call(req: MCPToolRequest):
                 restart_deployment,
                 scale_deployment,
                 patch_workload,
+                replace_immutable_workload,
                 create_workload,
                 patch_service,
                 patch_service_account,
@@ -12178,6 +13250,7 @@ async def mcp_call(req: MCPToolRequest):
             "restart_deployment": restart_deployment,
             "scale_deployment": scale_deployment,
             "patch_workload": patch_workload,
+            "replace_immutable_workload": replace_immutable_workload,
             "create_workload": create_workload,
             "patch_service": patch_service,
             "patch_service_account": patch_service_account,

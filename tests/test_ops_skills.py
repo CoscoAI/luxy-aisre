@@ -60,6 +60,47 @@ class OpsSkillCatalogTests(unittest.TestCase):
             self.assertTrue(published["enabled"])
             self.assertEqual(published["lifecycle"], "published")
 
+    def test_skill_usage_counts_only_execution_as_invocation_and_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "skills"
+            registry = OpsSkillRegistry(root)
+            skill_id = "skill-volume-permission-recovery"
+            for event in ("matched", "selected", "approval_requested", "executed", "succeeded", "rolled_back"):
+                registry.record_usage(skill_id, event)
+            reloaded = OpsSkillRegistry(root)
+            row = next(item for item in reloaded.usage_stats()["skills"] if item["skill_id"] == skill_id)
+            self.assertEqual(row["matched"], 1)
+            self.assertEqual(row["selected"], 1)
+            self.assertEqual(row["approval_requested"], 1)
+            self.assertEqual(row["executed"], 1)
+            self.assertEqual(row["succeeded"], 1)
+            self.assertEqual(row["rolled_back"], 1)
+            self.assertEqual(row["success_rate"], 1.0)
+            self.assertIn("executed 才计为 Skill 调用", reloaded.usage_stats()["definition"])
+
+    def test_skill_match_exposes_required_weighted_score_breakdown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = OpsSkillRegistry(Path(directory) / "skills")
+            match = registry.match({
+                "question": "Deployment mkdir /data/cache permission denied",
+                "evidence": {
+                    "logs": {"api": "mkdir /data/cache: permission denied"},
+                    "workload": {"kind": "Deployment"},
+                    "storage": [{"pvc_phase": "Bound"}],
+                },
+            })["matches"][0]
+            self.assertEqual(
+                set(match["score_breakdown"]),
+                {
+                    "symptom_log_match",
+                    "environment_match",
+                    "historical_success",
+                    "least_privilege",
+                    "recency_reliability",
+                },
+            )
+            self.assertIn("40/20/20/10/10", registry.match({"question": "permission denied"})["policy"])
+
     def test_persisted_builtin_skill_is_upgraded_to_current_security_policy(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "skills"
@@ -104,6 +145,91 @@ class OpsSkillCatalogTests(unittest.TestCase):
         self.assertEqual(attached["change_source"], "dynamic_skill")
         self.assertEqual(attached["changes"][0]["skill_id"], "skill-volume-permission-recovery")
         self.assertTrue(attached["changes"][0]["skill_supported"])
+
+    def test_adaptive_router_activates_only_highest_ranked_skill(self):
+        primary = {
+            "id": "primary",
+            "name": "最高匹配",
+            "category": "storage",
+            "summary": "permission denied",
+            "diagnostic_steps": ["读取日志"],
+            "evidence_required": [],
+            "allowed_actions": ["restart"],
+            "success_criteria": ["pod_ready"],
+            "risk": "low",
+            "enabled": True,
+            "execution_ready": True,
+        }
+        secondary = {
+            **primary,
+            "id": "secondary",
+            "name": "次高匹配",
+            "allowed_actions": ["patch_workload"],
+        }
+        plan = {
+            "namespace": "default",
+            "target": "Deployment/api",
+            "changes": [{
+                "type": "restart",
+                "namespace": "default",
+                "workload_type": "Deployment",
+                "workload_name": "api",
+            }],
+        }
+        matches = {
+            "matches": [
+                {"skill": primary, "confidence": 0.92, "score": 0.92},
+                {"skill": secondary, "confidence": 0.90, "score": 0.90},
+            ],
+            "execution_threshold": 0.70,
+        }
+        with (
+            patch.object(server.OPS_SKILL_REGISTRY, "match", return_value=matches),
+            patch.object(server.OPS_SKILL_REGISTRY, "record_usage"),
+        ):
+            attached = server._attach_operator_skills_to_plan(plan, {"question": "permission denied"})
+        self.assertEqual(attached["selected_skill_id"], "primary")
+        self.assertEqual(attached["skill_execution_mode"], "adaptive_serial")
+        self.assertEqual(len(attached["operator_skills"]), 2)
+        self.assertEqual(attached["changes"][0]["skill_id"], "primary")
+        self.assertEqual(attached["skill_allowed_actions"], ["restart"])
+
+    def test_low_confidence_skill_runs_diagnostics_before_mutation(self):
+        skill = {
+            "id": "uncertain",
+            "name": "低置信度 Skill",
+            "category": "storage",
+            "summary": "possible storage issue",
+            "diagnostic_steps": ["读取 Events"],
+            "evidence_required": [],
+            "allowed_actions": ["restart"],
+            "success_criteria": ["pod_ready"],
+            "risk": "low",
+            "enabled": True,
+            "execution_ready": True,
+        }
+        matches = {
+            "matches": [{"skill": skill, "confidence": 0.69, "score": 0.69}],
+            "execution_threshold": 0.70,
+        }
+        plan = {
+            "namespace": "default",
+            "target": "Deployment/api",
+            "changes": [{
+                "type": "restart",
+                "namespace": "default",
+                "workload_type": "Deployment",
+                "workload_name": "api",
+            }],
+        }
+        with (
+            patch.object(server.OPS_SKILL_REGISTRY, "match", return_value=matches),
+            patch.object(server.OPS_SKILL_REGISTRY, "record_usage"),
+        ):
+            attached = server._attach_operator_skills_to_plan(plan, {"question": "uncertain"})
+        self.assertEqual(attached["decision"], "diagnostic_skill_then_rerank")
+        self.assertEqual(attached["changes"], [])
+        self.assertEqual(attached["_blocked_low_confidence_changes"][0]["type"], "restart")
 
     def test_dynamic_skill_blocks_mutation_until_required_evidence_is_collected(self):
         plan = {

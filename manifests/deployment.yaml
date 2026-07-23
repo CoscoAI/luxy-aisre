@@ -4,7 +4,7 @@ metadata:
   name: k8s-agent-config
   namespace: k8s-agent
 data:
-  APP_BUILD_VERSION: '3.2.2'
+  APP_BUILD_VERSION: '3.2.3'
   OAUTH_TOKEN_URL: ''
   LLM_GATEWAY_BASE: ''
   LLM_API_BASE: http://ollama.default.svc.cluster.local:11434/v1
@@ -125,9 +125,13 @@ data:
   AUTO_OPS_DEFAULT_STORAGE_CLASS: standard
   # PVC Pending 且确需静态供卷时，由存储管理员填写已批准的 NFS 后端。
   AUTO_OPS_STATIC_PV_TEMPLATE_JSON: '{}'
+  AUTO_OPS_STATIC_PV_TEMPLATES_JSON: '{}'
   AUTO_OPS_STATIC_PV_NFS_SERVER: ''
   AUTO_OPS_STATIC_PV_NFS_BASE_PATH: ''
   AUTO_OPS_STATIC_PV_RECLAIM_POLICY: Retain
+  # Per-cluster local path allowlist. Empty means local/host-path PV automation is denied.
+  AUTO_OPS_HOSTPATH_BASE_PATHS_JSON: '{}'
+  AUTO_OPS_ALLOW_LOCAL_STATIC_PV: 'false'
   # 缺失 ConfigMap 只能从这里的批准模板恢复，严禁让模型自行编造配置值。
   # 示例：{"prod/app-config":{"data":{"APP_MODE":"prod"}}}
   AUTO_OPS_CONFIGMAP_TEMPLATES_JSON: '{}'
@@ -137,6 +141,8 @@ data:
   # 仅用于自动迁移旧版本单文件注册表；迁移完成后以 OPS_SKILL_ROOT 为事实来源。
   OPS_SKILL_STORE_PATH: /var/lib/flawless/ops-skills.json
   OPS_JOB_STORE_PATH: /var/lib/flawless/ops-jobs.json
+  OPS_RECORD_RETENTION_DAYS: '365'
+  OPS_JOB_STORE_LIMIT: '5000'
   # 示例：[{"id":"inspect-pvc-permission","name":"PVC 目录权限检查","description":"只读检查挂载目录属主和权限","risk":"medium","runner":"enterprise-script-runner","allowed_targets":["Pod","PVC"],"required_evidence":["previous_logs","storage_chain"]}]
   OPS_APPROVED_SCRIPTS_JSON: '[]'
   OUTBOUND_VERIFY_SSL: 'true'
@@ -172,6 +178,7 @@ data:
   OPS_MAX_CONCURRENT_JOBS: '4'
   OPS_VERIFY_TIMEOUT_SECONDS: '45'
   OPS_VERIFY_INTERVAL_SECONDS: '5'
+  OPS_RECOVERY_STABILITY_SECONDS: '180'
   OPS_EVIDENCE_TIMEOUT_SECONDS: '70'
   OPS_STEP_TIMEOUT_SECONDS: '35'
   OPS_CHANGE_TIMEOUT_SECONDS: '45'
@@ -265,7 +272,7 @@ spec:
           type: RuntimeDefault
       containers:
       - name: mcp-server
-        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.2
+        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.3
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -305,7 +312,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: observability-agent
-        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.2
+        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.3
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -364,7 +371,7 @@ spec:
             cpu: 1
             memory: 1Gi
       - name: healing-agent
-        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.2
+        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.3
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -404,7 +411,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: incident-agent
-        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.2
+        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.3
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -444,7 +451,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: postmortem-agent
-        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.2
+        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.3
         imagePullPolicy: Always
         command:
         - sh
@@ -498,7 +505,7 @@ spec:
           periodSeconds: 10
           timeoutSeconds: 3
       - name: openwebui-adapter
-        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.2
+        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.3
         imagePullPolicy: Always
         command:
         - uvicorn

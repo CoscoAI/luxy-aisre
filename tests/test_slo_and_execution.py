@@ -104,7 +104,7 @@ class ErrorBudgetTests(unittest.TestCase):
         steps = server._storage_admin_steps(plan)
         self.assertFalse(any("建议属组" in step or "472:472" in step for step in steps))
 
-    def test_storage_permission_followup_requires_new_evidence_and_skill(self):
+    def test_storage_permission_followup_starts_with_nonroot_group_patch(self):
         plan = {
             "namespace": "monitoring",
             "target": "Deployment/grafana",
@@ -122,9 +122,74 @@ class ErrorBudgetTests(unittest.TestCase):
             "changes": [{"type": "patch_workload", "workload_type": "Deployment", "workload_name": "grafana"}],
         }
         followups = server._derive_followup_plans(plan, "storage volume permission denied")
-        self.assertEqual(followups[0]["changes"], [])
-        self.assertEqual(followups[0]["source"], "dynamic_skill_evidence_required")
-        self.assertTrue(followups[0]["operator_steps"])
+        self.assertEqual(len(followups[0]["changes"]), 1)
+        self.assertEqual(followups[0]["source"], "progressive_permission_recovery")
+        self.assertEqual(followups[0]["permission_recovery_stage"], "nonroot_group")
+        patch = followups[0]["changes"][0]["patch"]
+        self.assertEqual(patch["spec"]["template"]["spec"]["securityContext"]["fsGroup"], 472)
+        self.assertTrue(patch["spec"]["template"]["spec"]["containers"][0]["securityContext"]["runAsNonRoot"])
+
+    def test_permission_recovery_escalates_to_bounded_init_then_failing_container_root(self):
+        pod = {
+            "name": "grafana-abc",
+            "containers": [{
+                "name": "grafana",
+                "security_context": {"runAsUser": 472, "runAsGroup": 472},
+                "volume_mounts": [{
+                    "name": "data",
+                    "mount_path": "/var/lib/grafana",
+                    "sub_path": "grafana",
+                }],
+            }],
+        }
+        nonroot_change = {
+            "type": "patch_workload_runtime_security",
+            "patch": {"spec": {"template": {"spec": {
+                "securityContext": {"fsGroup": 472},
+                "containers": [{
+                    "name": "grafana",
+                    "securityContext": {"runAsUser": 472, "runAsGroup": 472, "runAsNonRoot": True},
+                }],
+            }}}},
+        }
+        base = {
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "summary": "volume permission denied",
+            "evidence": {"state_text": "permission denied", "pod": pod},
+            "_runtime_evidence": {
+                "pod_name": "grafana-abc",
+                "pod": pod,
+                "logs": {"grafana": {"current": "mkdir /var/lib/grafana/plugins: permission denied"}},
+            },
+            "_last_failure": {"attempted_changes": [nonroot_change]},
+        }
+        with patch.dict(os.environ, {"NODE_EXEC_IMAGE": "busybox:1.36"}):
+            init_plan = server._permission_recovery_followup(base)
+        self.assertEqual(init_plan["permission_recovery_stage"], "init_owner")
+        init = init_plan["changes"][0]["patch"]["spec"]["template"]["spec"]["initContainers"][0]
+        self.assertEqual(init["securityContext"]["runAsUser"], 0)
+        self.assertEqual(init["volumeMounts"][0]["mountPath"], "/var/lib/grafana")
+        self.assertEqual(init["volumeMounts"][0]["subPath"], "grafana")
+        self.assertIn("chown -R 472:472", init["args"][0])
+        self.assertEqual(
+            init_plan["changes"][0]["patch"]["spec"]["template"]["spec"]["containers"][0]["securityContext"]["runAsUser"],
+            472,
+        )
+
+        escalated = {
+            **base,
+            "_last_failure": {
+                "attempted_changes": [nonroot_change, init_plan["changes"][0]],
+            },
+        }
+        root_plan = server._permission_recovery_followup(escalated)
+        self.assertEqual(root_plan["permission_recovery_stage"], "root")
+        root_spec = root_plan["changes"][0]["patch"]["spec"]["template"]["spec"]
+        self.assertEqual(root_spec["securityContext"]["fsGroup"], 0)
+        self.assertEqual(len(root_spec["containers"]), 1)
+        self.assertEqual(root_spec["containers"][0]["name"], "grafana")
+        self.assertEqual(root_spec["containers"][0]["securityContext"]["runAsUser"], 0)
 
     def test_99_percent_slo_has_one_percent_budget(self):
         budget = evaluate_error_budget({
@@ -808,6 +873,7 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
                 "requested": "10Gi",
                 "access_modes": ["ReadWriteMany"],
                 "storage_class": "nfs-static",
+                "storage_class_provisioner": "kubernetes.io/no-provisioner",
             }],
             "logs": {},
             "workload": {

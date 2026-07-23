@@ -1684,6 +1684,20 @@ body[data-theme="dark"] .flow-module {
 .skill-card footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
 .skill-card footer div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
 .skill-card footer button { display: inline-flex; align-items: center; gap: 4px; }
+.skill-stat-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(250px,1fr)); gap: 8px; margin-bottom: 10px; }
+.skill-stat-grid article { display: grid; gap: 4px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+.skill-stat-grid article > strong { font-size: 10px; }
+.skill-stat-grid article > small { color: var(--muted); font-size: 8px; }
+.skill-stat-grid article > div { display: grid; grid-template-columns: repeat(4,1fr); gap: 5px; margin-top: 4px; }
+.skill-stat-grid span { display: grid; gap: 2px; color: var(--muted); font-size: 8px; }
+.skill-stat-grid b { color: var(--text); font-size: 11px; }
+.ops-record-list { display: grid; gap: 7px; max-height: 480px; overflow: auto; }
+.ops-record-list article { display: grid; gap: 6px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+.ops-record-list article > div { display: flex; align-items: center; gap: 7px; }
+.ops-record-list article strong { font-size: 10px; }
+.ops-record-list article small,.ops-record-list article p,.ops-record-list article footer { color: var(--muted); font-size: 8px; }
+.ops-record-list article p { margin: 0; line-height: 1.5; }
+.ops-record-list article footer { display: flex; align-items: center; justify-content: space-between; }
 .skill-match-box { display: grid; gap: 8px; }
 .ops-skill-strip { display: flex; flex-wrap: wrap; gap: 7px; margin: 9px 0; padding: 9px; border: 1px solid color-mix(in srgb,var(--brand) 30%,var(--line)); border-radius: 8px; background: var(--brand-soft); }
 .ops-skill-strip > b { width: 100%; color: var(--brand-2); font-size: 9px; }

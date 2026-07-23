@@ -1,6 +1,7 @@
 """Evidence-driven remediation planning and approval policy."""
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -52,6 +53,11 @@ ACTION_CATALOG: dict[str, dict[str, Any]] = {
     "recreate_pod": {
         "risk": "medium", "auto_allowed": True, "rollback": "controller recreates the pod from the unchanged template",
         "description": "Delete one controller-owned unhealthy pod for clean rescheduling.",
+    },
+    "replace_immutable_workload": {
+        "risk": "high", "auto_allowed": False,
+        "rollback": "recreate the saved live Pod/Job object with its previous pod template",
+        "description": "Replace one standalone Pod or immutable Job from a server-side live snapshot after showing the bounded template patch.",
     },
     "patch_hpa": {
         "risk": "medium", "auto_allowed": True, "rollback": "restore previous HPA min/max replicas",
@@ -175,6 +181,7 @@ ACTION_OPERATOR_GUIDANCE: dict[str, dict[str, str]] = {
     "restart": {"label": "滚动重启组件", "when_to_use": "配置已正确但进程卡死、连接未刷新或需要让 Workload 重新拉起 Pod。", "operator_note": "不会修复错误配置；必须先确认有足够副本和 PDB 允许滚动。"},
     "scale_out": {"label": "增加副本", "when_to_use": "CPU、并发或流量证据显示容量不足，且应用支持水平扩展。", "operator_note": "只在副本上限内扩容，并观察下游依赖和资源配额。"},
     "recreate_pod": {"label": "重建异常 Pod", "when_to_use": "单个 controller 管理的 Pod 状态损坏，而 Workload 模板和其他副本正常。", "operator_note": "删除后由控制器按原模板重建；不适合模板级、存储级或全副本故障。"},
+    "replace_immutable_workload": {"label": "替换不可变 Pod/Job", "when_to_use": "独立 Pod 或 Job 的 PodSpec 必须修复，且 Kubernetes 不允许原地 patch。", "operator_note": "高风险；服务端先保存实时对象，再删除并按批准补丁重建，不能用于 controller 管理的 Pod。"},
     "patch_hpa": {"label": "调整 HPA 范围", "when_to_use": "HPA 上下限阻止合理扩缩容，且指标语义和数据源正常。", "operator_note": "不会修改指标算法，只调整 min/max replicas。"},
     "expand_pvc": {"label": "扩容 PVC", "when_to_use": "卷使用率接近上限，StorageClass 明确支持扩容。", "operator_note": "通常不可逆；必须核对文件系统扩容支持和业务备份。"},
     "create_pvc": {"label": "创建缺失 PVC", "when_to_use": "Workload 明确引用不存在的 PVC，且存储策略、容量和访问模式已确认。", "operator_note": "高风险；只能按批准的 StorageClass 或模板创建。"},
@@ -733,6 +740,52 @@ def _storage_quantity(value: Any) -> str:
     return os.getenv("AUTO_OPS_DEFAULT_PVC_SIZE", "10Gi")
 
 
+def _storage_quantity_bytes(value: Any) -> float | None:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([KMGTPE]i?|)", text)
+    if not match:
+        return None
+    number = float(match.group(1))
+    suffix = match.group(2)
+    binary = {"Ki": 1, "Mi": 2, "Gi": 3, "Ti": 4, "Pi": 5, "Ei": 6}
+    decimal = {"K": 1, "M": 2, "G": 3, "T": 4, "P": 5, "E": 6}
+    if suffix in binary:
+        return number * (1024 ** binary[suffix])
+    if suffix in decimal:
+        return number * (1000 ** decimal[suffix])
+    return number
+
+
+def _apply_and_validate_pv_selector(manifest: dict[str, Any], selector: dict[str, Any]) -> bool:
+    if not selector:
+        return True
+    metadata = manifest.setdefault("metadata", {})
+    labels = metadata.setdefault("labels", {})
+    if not isinstance(labels, dict):
+        return False
+    match_labels = selector.get("matchLabels") or {}
+    if not isinstance(match_labels, dict):
+        return False
+    labels.update({str(key): str(value) for key, value in match_labels.items()})
+    for expression in selector.get("matchExpressions") or []:
+        if not isinstance(expression, dict):
+            return False
+        key = str(expression.get("key") or "")
+        operator = str(expression.get("operator") or "")
+        values = [str(value) for value in expression.get("values") or []]
+        if operator == "In" and labels.get(key) not in values:
+            return False
+        if operator == "NotIn" and key in labels and labels.get(key) in values:
+            return False
+        if operator == "Exists" and key not in labels:
+            return False
+        if operator == "DoesNotExist" and key in labels:
+            return False
+        if operator not in {"In", "NotIn", "Exists", "DoesNotExist"}:
+            return False
+    return True
+
+
 def _pvc_manifest(namespace: str, pvc_name: str, issue: dict[str, Any]) -> dict[str, Any]:
     storage_class = str(issue.get("storage_class") or os.getenv("AUTO_OPS_DEFAULT_STORAGE_CLASS", "")).strip()
     spec: dict[str, Any] = {
@@ -754,29 +807,89 @@ def _pvc_manifest(namespace: str, pvc_name: str, issue: dict[str, Any]) -> dict[
 
 
 def _static_pv_manifest(namespace: str, pvc_name: str, issue: dict[str, Any]) -> dict[str, Any]:
-    raw_template = os.getenv("AUTO_OPS_STATIC_PV_TEMPLATE_JSON", "").strip()
+    provisioner = str(issue.get("storage_class_provisioner") or issue.get("provisioner") or "").strip()
+    explicitly_static = bool(issue.get("static_provisioning")) or provisioner in {
+        "kubernetes.io/no-provisioner",
+        "no-provisioner",
+    }
+    if not explicitly_static:
+        # A Pending PVC on a dynamic StorageClass is a CSI/provisioner,
+        # capacity or topology incident. Missing provisioner evidence is also
+        # insufficient to prove static provisioning. Creating a competing PV
+        # can bind the claim to the wrong backend and is therefore forbidden.
+        return {}
+    requested = str(issue.get("requested") or issue.get("capacity") or "").strip()
+    access_modes = issue.get("access_modes") or []
+    volume_mode = str(issue.get("volume_mode") or "Filesystem")
+    selector = issue.get("selector") or {}
+    if (
+        _storage_quantity_bytes(requested) is None
+        or not isinstance(access_modes, list)
+        or not access_modes
+        or volume_mode not in {"Filesystem", "Block"}
+        or not isinstance(selector, dict)
+    ):
+        return {}
+    storage_class = str(issue.get("storage_class") or os.getenv("AUTO_OPS_STATIC_PV_STORAGE_CLASS", "")).strip()
+    templates = _load_json_env("AUTO_OPS_STATIC_PV_TEMPLATES_JSON")
+    selected_template = templates.get(storage_class) if isinstance(templates, dict) and storage_class else None
+    raw_template = json.dumps(selected_template, ensure_ascii=False) if isinstance(selected_template, dict) else os.getenv("AUTO_OPS_STATIC_PV_TEMPLATE_JSON", "").strip()
     if raw_template:
         try:
-            import json
             manifest = json.loads(raw_template)
             manifest.setdefault("metadata", {}).setdefault("name", f"pv-{namespace}-{pvc_name}")
-            manifest.setdefault("spec", {}).setdefault("claimRef", {"namespace": namespace, "name": pvc_name})
+            spec = manifest.setdefault("spec", {})
+            spec["persistentVolumeReclaimPolicy"] = "Retain"
+            spec["claimRef"] = {"namespace": namespace, "name": pvc_name}
+            spec["storageClassName"] = storage_class
+            spec["accessModes"] = access_modes
+            spec["volumeMode"] = volume_mode
+            capacity = str((spec.setdefault("capacity", {})).get("storage") or requested)
+            if (
+                _storage_quantity_bytes(capacity) is None
+                or _storage_quantity_bytes(capacity) < _storage_quantity_bytes(requested)
+            ):
+                return {}
+            spec["capacity"]["storage"] = capacity
+            if not _apply_and_validate_pv_selector(manifest, selector):
+                return {}
             return manifest
         except Exception:
             return {}
     nfs_server = os.getenv("AUTO_OPS_STATIC_PV_NFS_SERVER", "").strip()
     nfs_base = os.getenv("AUTO_OPS_STATIC_PV_NFS_BASE_PATH", "").strip().rstrip("/")
-    storage_class = str(issue.get("storage_class") or os.getenv("AUTO_OPS_STATIC_PV_STORAGE_CLASS", "")).strip()
     allow_local = os.getenv("AUTO_OPS_ALLOW_LOCAL_STATIC_PV", "false").lower() in {"1", "true", "yes", "on"}
-    local_base = os.getenv("AUTO_OPS_STATIC_PV_LOCAL_BASE_PATH", "").strip().rstrip("/")
+    cluster_id = str(issue.get("cluster_id") or issue.get("cluster") or "").strip()
+    allowed_bases = _load_json_env("AUTO_OPS_HOSTPATH_BASE_PATHS_JSON")
+    cluster_bases = allowed_bases.get(cluster_id) if isinstance(allowed_bases, dict) and cluster_id else None
+    cluster_bases = [str(item).rstrip("/") for item in cluster_bases or [] if str(item).startswith("/")]
+    legacy_e2e_base = os.getenv("AUTO_OPS_STATIC_PV_LOCAL_BASE_PATH", "").strip().rstrip("/")
+    if allow_local and not cluster_id and legacy_e2e_base and not cluster_bases:
+        # Backward-compatible local test path. Production clusters must use the
+        # per-cluster AUTO_OPS_HOSTPATH_BASE_PATHS_JSON allowlist.
+        cluster_bases = [legacy_e2e_base]
+    local_base = (cluster_bases[0] if cluster_bases else "").rstrip("/")
     local_node = str(issue.get("node") or os.getenv("AUTO_OPS_STATIC_PV_LOCAL_NODE", "")).strip()
-    if allow_local and local_base and local_node:
+    local_path = str(issue.get("local_path") or issue.get("host_path") or "").strip()
+    if not local_path and local_base:
+        local_path = f"{local_base}/{namespace}/{pvc_name}"
+    local_path_allowed = bool(
+        local_path
+        and any(local_path == base or local_path.startswith(f"{base}/") for base in cluster_bases)
+    )
+    local_path_ready = bool(
+        issue.get("node_path_exists")
+        or issue.get("host_path_creation_approved")
+        or (not cluster_id and legacy_e2e_base)
+    )
+    if allow_local and local_path_allowed and local_path_ready and local_node:
         spec: dict[str, Any] = {
-            "capacity": {"storage": _storage_quantity(issue.get("requested") or issue.get("capacity"))},
-            "accessModes": issue.get("access_modes") or [os.getenv("AUTO_OPS_DEFAULT_PVC_ACCESS_MODE", "ReadWriteOnce")],
-            "persistentVolumeReclaimPolicy": os.getenv("AUTO_OPS_STATIC_PV_RECLAIM_POLICY", "Retain"),
+            "capacity": {"storage": requested},
+            "accessModes": access_modes,
+            "volumeMode": volume_mode,
+            "persistentVolumeReclaimPolicy": "Retain",
             "claimRef": {"namespace": namespace, "name": pvc_name},
-            "local": {"path": f"{local_base}/{namespace}/{pvc_name}"},
+            "local": {"path": local_path},
             "nodeAffinity": {
                 "required": {
                     "nodeSelectorTerms": [{
@@ -789,9 +902,8 @@ def _static_pv_manifest(namespace: str, pvc_name: str, issue: dict[str, Any]) ->
                 }
             },
         }
-        if storage_class:
-            spec["storageClassName"] = storage_class
-        return {
+        spec["storageClassName"] = storage_class
+        manifest = {
             "apiVersion": "v1",
             "kind": "PersistentVolume",
             "metadata": {
@@ -800,18 +912,19 @@ def _static_pv_manifest(namespace: str, pvc_name: str, issue: dict[str, Any]) ->
             },
             "spec": spec,
         }
+        return manifest if _apply_and_validate_pv_selector(manifest, selector) else {}
     if not nfs_server or not nfs_base:
         return {}
     spec: dict[str, Any] = {
-        "capacity": {"storage": _storage_quantity(issue.get("requested") or issue.get("capacity"))},
-        "accessModes": issue.get("access_modes") or [os.getenv("AUTO_OPS_DEFAULT_PVC_ACCESS_MODE", "ReadWriteOnce")],
-        "persistentVolumeReclaimPolicy": os.getenv("AUTO_OPS_STATIC_PV_RECLAIM_POLICY", "Retain"),
+        "capacity": {"storage": requested},
+        "accessModes": access_modes,
+        "volumeMode": volume_mode,
+        "persistentVolumeReclaimPolicy": "Retain",
         "claimRef": {"namespace": namespace, "name": pvc_name},
         "nfs": {"server": nfs_server, "path": f"{nfs_base}/{namespace}/{pvc_name}"},
     }
-    if storage_class:
-        spec["storageClassName"] = storage_class
-    return {
+    spec["storageClassName"] = storage_class
+    manifest = {
         "apiVersion": "v1",
         "kind": "PersistentVolume",
         "metadata": {
@@ -820,6 +933,7 @@ def _static_pv_manifest(namespace: str, pvc_name: str, issue: dict[str, Any]) ->
         },
         "spec": spec,
     }
+    return manifest if _apply_and_validate_pv_selector(manifest, selector) else {}
 
 
 def _load_json_env(name: str) -> Any:
@@ -1208,10 +1322,23 @@ def build_remediation_plan(alert: dict, diagnosis: dict, context: dict) -> dict[
         issue = _first_storage_issue(context)
         pvc_name = str(issue.get("pvc") or issue.get("pvc_name") or issue.get("claim") or "").strip()
         if pvc_name and str(issue.get("pvc_phase") or issue.get("phase") or "").lower() in {"pending", "lost"}:
-            evidence_gap = (
-                f"PVC {namespace}/{pvc_name} 未绑定到 PV，但平台没有配置 AUTO_OPS_STATIC_PV_TEMPLATE_JSON "
-                "或 AUTO_OPS_STATIC_PV_NFS_SERVER/AUTO_OPS_STATIC_PV_NFS_BASE_PATH，因此不能安全创建静态 PV。"
-            )
+            provisioner = str(issue.get("storage_class_provisioner") or issue.get("provisioner") or "").strip()
+            explicitly_static = bool(issue.get("static_provisioning")) or provisioner in {
+                "kubernetes.io/no-provisioner",
+                "no-provisioner",
+            }
+            if not explicitly_static:
+                evidence_gap = (
+                    f"PVC {namespace}/{pvc_name} 的 provisioner={provisioner or '未确认'}；"
+                    "必须先确认 StorageClass 供给模式。动态模式应修复 CSI controller/node、容量或拓扑，"
+                    "禁止在证据不完整时创建竞争性的静态 PV。"
+                )
+            else:
+                evidence_gap = (
+                    f"PVC {namespace}/{pvc_name} 未绑定到 PV，但平台没有对应 StorageClass 的 "
+                    "AUTO_OPS_STATIC_PV_TEMPLATES_JSON/AUTO_OPS_STATIC_PV_TEMPLATE_JSON/NFS 批准参数，"
+                    "或本地路径没有满足集群 allowlist、目标节点与目录存在性条件，因此不能安全创建静态 PV。"
+                )
     if not changes and runbook_id == "config_missing":
         configmap_name = _extract_missing_configmap(context)
         if configmap_name:

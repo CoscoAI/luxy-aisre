@@ -36,14 +36,14 @@ DEFAULT_OPERATOR_SKILLS: list[dict[str, Any]] = [
         "category": "storage",
         "summary": "根据 mkdir permission denied 的真实日志、运行用户、挂载和 Workload 配置动态选择 YAML Patch 或受审批命令，并重新发布验证。",
         "symptoms": ["mkdir", "permission denied", "can't create directory", "read-only file system", "CrashLoopBackOff"],
-        "applies_to": ["Pod", "Deployment", "StatefulSet", "DaemonSet", "PVC", "PV"],
+        "applies_to": ["Pod", "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "PVC", "PV"],
         "evidence_required": ["previous_logs", "workload_spec", "pod_security_context", "storage_chain", "recent_changes"],
         "diagnostic_steps": [
             "读取失败容器的 current/previous logs，锁定实际 mkdir 路径、运行阶段和退出码。",
             "读取镜像运行用户、Pod/容器 securityContext、volumeMount、PVC/PV 与后端访问模式，不预设 fsGroup 一定正确。",
             "让 AI 基于证据生成实际 YAML Patch 或受控命令，展示完整 diff、重新发布方式、回滚和恢复判据。",
         ],
-        "allowed_actions": ["patch_workload", "patch_workload_runtime_security", "patch_resource", "apply_manifest", "exec_pod", "exec_node"],
+        "allowed_actions": ["patch_workload", "patch_workload_runtime_security", "replace_immutable_workload", "patch_resource", "apply_manifest", "exec_pod", "exec_node"],
         "success_criteria": ["rollout_complete", "pod_ready", "restart_count_stable", "events_no_new_backoff", "write_errors_absent"],
         "risk": "high",
         "rollback": "恢复变更前 Workload/PVC 快照并重新 rollout；节点或 Pod 命令使用计划中逐项声明的回滚命令。",
@@ -57,7 +57,7 @@ DEFAULT_OPERATOR_SKILLS: list[dict[str, Any]] = [
         "category": "runtime",
         "summary": "把 CrashLoopBackOff 按 OOM、探针、配置、挂载、镜像和依赖故障分流，避免只会重启。",
         "symptoms": ["CrashLoopBackOff", "Back-off restarting", "exit code 137", "probe failed", "permission denied"],
-        "applies_to": ["Pod", "Deployment", "StatefulSet", "DaemonSet"],
+        "applies_to": ["Pod", "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"],
         "evidence_required": ["previous_logs", "events", "last_state", "workload_spec", "recent_changes"],
         "diagnostic_steps": [
             "读取 current/previous logs 和 lastState，先判定退出码与信号。",
@@ -77,7 +77,7 @@ DEFAULT_OPERATOR_SKILLS: list[dict[str, Any]] = [
         "category": "storage",
         "summary": "处理 PVC 缺失、Pending、PV 未绑定、挂载失败和目录权限问题。",
         "symptoms": ["FailedMount", "FailedAttachVolume", "persistentvolumeclaim not found", "no persistent volumes available", "read-only file system"],
-        "applies_to": ["Pod", "PVC", "PV", "StatefulSet"],
+        "applies_to": ["Pod", "PVC", "PV", "StatefulSet", "Job", "CronJob"],
         "evidence_required": ["storage_chain", "events", "storage_class", "workload_spec"],
         "diagnostic_steps": [
             "沿 Pod volume -> PVC -> PV -> StorageClass/CSI 读取真实状态。",
@@ -328,6 +328,17 @@ def _clip(value: Any, limit: int = 2200) -> str:
     return text[:limit]
 
 
+SKILL_USAGE_FIELDS = (
+    "matched",
+    "selected",
+    "approval_requested",
+    "executed",
+    "succeeded",
+    "failed",
+    "rolled_back",
+)
+
+
 class OpsSkillRegistry:
     """线程安全的 Skill 注册表，以 Agent Skills 标准目录作为事实来源。"""
 
@@ -340,11 +351,57 @@ class OpsSkillRegistry:
             self.root = path
             self.legacy_path = legacy_path
         self.path = self.root
+        self.metrics_path = self.root / "_usage.json"
         self._lock = threading.RLock()
         self._skills: dict[str, dict[str, Any]] = {}
+        self._usage: dict[str, dict[str, Any]] = {}
         self._writable = True
         self._load_errors: list[str] = []
         self._load()
+        self._load_usage()
+
+    def _load_usage(self) -> None:
+        with self._lock:
+            try:
+                if self.metrics_path.is_file():
+                    raw = json.loads(self.metrics_path.read_text(encoding="utf-8"))
+                    items = raw.get("skills") if isinstance(raw, dict) else {}
+                    if isinstance(items, dict):
+                        self._usage = {
+                            str(skill_id): self._normalize_usage(value)
+                            for skill_id, value in items.items()
+                            if isinstance(value, dict)
+                        }
+            except Exception as exc:
+                self._load_errors.append(f"usage:{type(exc).__name__}:{exc}")
+
+    @staticmethod
+    def _normalize_usage(value: dict[str, Any] | None = None) -> dict[str, Any]:
+        value = value or {}
+        return {
+            **{field: max(0, int(value.get(field) or 0)) for field in SKILL_USAGE_FIELDS},
+            "last_matched_at": str(value.get("last_matched_at") or ""),
+            "last_selected_at": str(value.get("last_selected_at") or ""),
+            "last_executed_at": str(value.get("last_executed_at") or ""),
+            "last_succeeded_at": str(value.get("last_succeeded_at") or ""),
+            "last_failed_at": str(value.get("last_failed_at") or ""),
+        }
+
+    def _persist_usage(self) -> None:
+        if not self._writable:
+            return
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "updated_at": _now(),
+                "skills": self._usage,
+            }
+            temporary = self.metrics_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
+            os.replace(temporary, self.metrics_path)
+        except Exception as exc:
+            self._load_errors.append(f"usage-persist:{type(exc).__name__}:{exc}")
 
     def _load(self):
         with self._lock:
@@ -490,13 +547,18 @@ class OpsSkillRegistry:
     def list(self) -> dict[str, Any]:
         with self._lock:
             skills = sorted(self._skills.values(), key=lambda item: (not item.get("enabled", True), item.get("category", ""), item.get("name", "")))
+            public_skills = []
+            for skill in skills:
+                item = deepcopy(skill)
+                item["usage"] = deepcopy(self._normalize_usage(self._usage.get(str(skill.get("id")))))
+                public_skills.append(item)
             return {
                 "status": "ok",
                 "writable": self._writable,
                 "store_path": str(self.root),
                 "store_format": AGENT_SKILL_SPEC,
                 "load_errors": deepcopy(self._load_errors[-20:]),
-                "skills": deepcopy(skills),
+                "skills": public_skills,
                 "summary": {
                     "total": len(skills),
                     "enabled": sum(1 for item in skills if item.get("enabled", True)),
@@ -506,6 +568,56 @@ class OpsSkillRegistry:
                     "execution_ready": sum(1 for item in skills if item.get("execution_ready")),
                     "candidates": sum(1 for item in skills if item.get("lifecycle") == "candidate"),
                 },
+            }
+
+    def record_usage(self, skill_id: str, event: str) -> dict[str, Any]:
+        """Persist one lifecycle counter.
+
+        ``executed`` is deliberately separate from matching, selection and
+        approval so the UI never calls a recommendation an invocation.
+        """
+        if event not in SKILL_USAGE_FIELDS:
+            raise ValueError(f"unsupported skill usage event: {event}")
+        with self._lock:
+            usage = self._normalize_usage(self._usage.get(skill_id))
+            usage[event] += 1
+            now = _now()
+            if event == "matched":
+                usage["last_matched_at"] = now
+            elif event == "selected":
+                usage["last_selected_at"] = now
+            elif event == "executed":
+                usage["last_executed_at"] = now
+            elif event == "succeeded":
+                usage["last_succeeded_at"] = now
+            elif event == "failed":
+                usage["last_failed_at"] = now
+            self._usage[skill_id] = usage
+            self._persist_usage()
+            return deepcopy(usage)
+
+    def usage_stats(self) -> dict[str, Any]:
+        with self._lock:
+            rows = []
+            totals = self._normalize_usage()
+            for skill_id, skill in self._skills.items():
+                usage = self._normalize_usage(self._usage.get(skill_id))
+                for field in SKILL_USAGE_FIELDS:
+                    totals[field] += usage[field]
+                executions = usage["executed"]
+                rows.append({
+                    "skill_id": skill_id,
+                    "skill_name": skill.get("name") or skill_id,
+                    "category": skill.get("category") or "custom",
+                    **usage,
+                    "success_rate": round(usage["succeeded"] / executions, 4) if executions else None,
+                })
+            rows.sort(key=lambda item: (-int(item["executed"]), -int(item["selected"]), item["skill_id"]))
+            return {
+                "status": "ok",
+                "definition": "executed 才计为 Skill 调用；matched/selected/approval_requested 仅表示路由与审批阶段。",
+                "totals": totals,
+                "skills": rows,
             }
 
     def upsert(self, item: dict[str, Any], *, actor: str) -> dict[str, Any]:
@@ -585,6 +697,7 @@ class OpsSkillRegistry:
 
     def match(self, payload: dict[str, Any], *, top_k: int = 5) -> dict[str, Any]:
         query_tokens = _tokenize(payload)
+        query_text = json.dumps(payload, ensure_ascii=False, default=str).lower()
         matches: list[dict[str, Any]] = []
         with self._lock:
             for skill in self._skills.values():
@@ -603,27 +716,81 @@ class OpsSkillRegistry:
                 hits = sorted(query_tokens & skill_tokens)
                 symptom_hits = sorted(_tokenize(skill.get("symptoms")) & query_tokens)
                 evidence_hits = sorted(_tokenize(skill.get("evidence_required")) & query_tokens)
-                score = len(hits) * 0.12 + len(symptom_hits) * 0.24 + len(evidence_hits) * 0.16
-                if skill.get("category") and str(skill.get("category")).lower() in query_tokens:
-                    score += 0.15
-                if score <= 0:
+                exact_symptoms = [
+                    str(item).lower()
+                    for item in skill.get("symptoms") or []
+                    if str(item).strip() and str(item).lower() in query_text
+                ]
+                if not hits and not exact_symptoms:
                     continue
-                confidence = min(0.98, round(0.18 + score, 3))
+                symptom_score = min(
+                    1.0,
+                    len(exact_symptoms) * 0.48
+                    + len(symptom_hits) * 0.22
+                    + min(0.3, len(hits) * 0.05),
+                )
+                applies_hits = sorted(_tokenize(skill.get("applies_to")) & query_tokens)
+                category_hit = bool(
+                    skill.get("category")
+                    and str(skill.get("category")).lower() in query_tokens
+                )
+                environment_score = min(
+                    1.0,
+                    len(applies_hits) * 0.32
+                    + len(evidence_hits) * 0.18
+                    + (0.22 if category_hit else 0.0),
+                )
+                usage = self._normalize_usage(self._usage.get(str(skill.get("id"))))
+                executions = usage["executed"]
+                historical_score = (
+                    (usage["succeeded"] + 1) / (executions + 2)
+                    if executions
+                    else 0.5
+                )
+                risk_score = {"low": 1.0, "medium": 0.72, "high": 0.45}.get(str(skill.get("risk")), 0.6)
+                recent_reliability_score = 0.7
+                if executions:
+                    failure_rate = usage["failed"] / max(1, executions)
+                    recent_reliability_score = max(0.1, min(1.0, historical_score * (1.0 - failure_rate * 0.35)))
+                score_breakdown = {
+                    "symptom_log_match": round(symptom_score, 4),
+                    "environment_match": round(environment_score, 4),
+                    "historical_success": round(historical_score, 4),
+                    "least_privilege": round(risk_score, 4),
+                    "recency_reliability": round(recent_reliability_score, 4),
+                }
+                score = (
+                    symptom_score * 0.40
+                    + environment_score * 0.20
+                    + historical_score * 0.20
+                    + risk_score * 0.10
+                    + recent_reliability_score * 0.10
+                )
+                confidence = min(0.99, round(score, 4))
                 matches.append({
                     "skill": deepcopy(skill),
-                    "score": round(score, 3),
+                    "score": round(score, 4),
                     "confidence": confidence,
+                    "score_breakdown": score_breakdown,
                     "matched_terms": hits[:12],
                     "matched_symptoms": symptom_hits[:8],
+                    "exact_symptoms": exact_symptoms[:8],
                     "matched_evidence": evidence_hits[:8],
-                    "why": f"命中 {len(hits)} 个语义词、{len(symptom_hits)} 个症状词、{len(evidence_hits)} 个证据词。",
+                    "why": (
+                        "按症状/日志 40%、环境 20%、同场景成功率 20%、"
+                        "最小权限 10%、近期可靠性 10% 加权。"
+                    ),
                 })
         matches.sort(key=lambda item: (-item["score"], item["skill"]["id"]))
         return {
             "status": "ok",
             "matches": matches[: max(1, min(20, top_k))],
             "query_terms": sorted(query_tokens)[:80],
-            "policy": "Skill 只增强诊断和计划生成，不直接扩大 Kubernetes 写权限。",
+            "policy": (
+                "候选按 40/20/20/10/10 加权；执行时只选择当前最高分 Skill，"
+                "低于 70% 先运行一个只读诊断 Skill 后重新排序。"
+            ),
+            "execution_threshold": 0.70,
         }
 
     def steps_from_matches(self, matches: list[dict[str, Any]], *, limit: int = 2) -> list[dict[str, Any]]:

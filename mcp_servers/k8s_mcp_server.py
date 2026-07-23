@@ -2,8 +2,11 @@ import os
 import json
 import ssl
 import base64
+import copy
 import tempfile
+import time
 from typing import Optional
+from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
@@ -726,15 +729,21 @@ def get_pod_logs(
 def _workload_api_path(workload_type: str, namespace: str, workload_name: str) -> str:
     resource = WORKLOAD_RESOURCE_MAP.get(str(workload_type).lower())
     if not resource:
-        raise ValueError("workload_type must be Deployment, StatefulSet, or DaemonSet")
-    return f"/apis/apps/v1/namespaces/{quote(namespace, safe='')}/{resource}/{quote(workload_name, safe='')}"
+        raise ValueError("workload_type must be Deployment, StatefulSet, DaemonSet, Job, or CronJob")
+    api_group = "batch/v1" if resource in {"jobs", "cronjobs"} else "apps/v1"
+    return f"/apis/{api_group}/namespaces/{quote(namespace, safe='')}/{resource}/{quote(workload_name, safe='')}"
 
 
 def _safe_workload_evidence(raw: dict) -> dict:
     """Keep operational fields while dropping env values and sensitive data."""
     metadata = raw.get("metadata") or {}
     spec = raw.get("spec") or {}
-    template = spec.get("template") or {}
+    if raw.get("kind") == "CronJob":
+        template = ((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}
+    elif raw.get("kind") == "Pod":
+        template = {"spec": spec}
+    else:
+        template = spec.get("template") or {}
     pod_spec = template.get("spec") or {}
     containers = []
     for container in pod_spec.get("containers", []) or []:
@@ -805,7 +814,7 @@ def get_pod_diagnostics(namespace: str, pod_name: str, tail_lines: int = 160) ->
 
     workload = {}
     owner = pod.get("workload") or {}
-    if owner.get("kind") in {"Deployment", "StatefulSet", "DaemonSet"} and owner.get("name"):
+    if owner.get("kind") in {"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"} and owner.get("name"):
         try:
             workload = _safe_workload_evidence(_k8s_get(_workload_api_path(owner["kind"], namespace, owner["name"])))
         except Exception as exc:
@@ -842,11 +851,26 @@ def get_pod_diagnostics(namespace: str, pod_name: str, tail_lines: int = 160) ->
             pvc = _k8s_get(f"/api/v1/namespaces/{quote(namespace, safe='')}/persistentvolumeclaims/{quote(claim, safe='')}")
             pv_name = (pvc.get("spec") or {}).get("volumeName")
             pv = _safe_k8s_get(f"/api/v1/persistentvolumes/{quote(pv_name, safe='')}") if pv_name else {}
+            storage_class = (pvc.get("spec") or {}).get("storageClassName")
+            storage_class_record = (
+                _safe_k8s_get(f"/apis/storage.k8s.io/v1/storageclasses/{quote(storage_class, safe='')}")
+                if storage_class else {}
+            )
             storage.append({
                 "volume": volume.get("name"), "pvc": claim, "pvc_phase": (pvc.get("status") or {}).get("phase"),
                 "requested": ((pvc.get("spec") or {}).get("resources") or {}).get("requests", {}).get("storage"),
                 "capacity": (pvc.get("status") or {}).get("capacity", {}).get("storage"),
-                "storage_class": (pvc.get("spec") or {}).get("storageClassName"), "pv": pv_name,
+                "storage_class": storage_class,
+                "storage_class_provisioner": storage_class_record.get("provisioner"),
+                "volume_binding_mode": storage_class_record.get("volumeBindingMode"),
+                "allow_volume_expansion": storage_class_record.get("allowVolumeExpansion"),
+                "access_modes": (pvc.get("spec") or {}).get("accessModes") or [],
+                "volume_mode": (pvc.get("spec") or {}).get("volumeMode") or "Filesystem",
+                "selector": (pvc.get("spec") or {}).get("selector") or {},
+                "pv": pv_name,
+                "pv_phase": (pv.get("status") or {}).get("phase"),
+                "pv_reclaim_policy": (pv.get("spec") or {}).get("persistentVolumeReclaimPolicy"),
+                "pv_node_affinity": (pv.get("spec") or {}).get("nodeAffinity") or {},
                 "csi_driver": ((pv.get("spec") or {}).get("csi") or {}).get("driver"),
             })
         except Exception as exc:
@@ -994,6 +1018,8 @@ def _validate_pv_manifest(manifest: dict) -> tuple[bool, str]:
     spec = manifest.get("spec") or {}
     if spec.get("hostPath"):
         return False, "hostPath PV is forbidden"
+    if spec.get("persistentVolumeReclaimPolicy") != "Retain":
+        return False, "statically proposed PV must use persistentVolumeReclaimPolicy=Retain"
     if not ((spec.get("capacity") or {}).get("storage")):
         return False, "spec.capacity.storage is required"
     if not isinstance(spec.get("accessModes") or [], list) or not spec.get("accessModes"):
@@ -1007,8 +1033,10 @@ def _validate_pv_manifest(manifest: dict) -> tuple[bool, str]:
     if not any(spec.get(key) for key in allowed_sources):
         return False, "PV must use approved network or CSI storage source"
     claim_ref = spec.get("claimRef") or {}
-    if claim_ref and (not claim_ref.get("namespace") or not claim_ref.get("name")):
-        return False, "claimRef must include namespace and name"
+    if not claim_ref.get("namespace") or not claim_ref.get("name"):
+        return False, "statically proposed PV must include claimRef namespace and name"
+    if spec.get("volumeMode") not in {"Filesystem", "Block"}:
+        return False, "PV volumeMode must explicitly match the PVC as Filesystem or Block"
     return True, ""
 
 
@@ -1185,10 +1213,18 @@ WORKLOAD_RESOURCE_MAP = {
     "statefulsets": "statefulsets",
     "daemonset": "daemonsets",
     "daemonsets": "daemonsets",
+    "job": "jobs",
+    "jobs": "jobs",
+    "cronjob": "cronjobs",
+    "cronjobs": "cronjobs",
 }
 
 
-def _validate_workload_patch(patch: dict, allow_volume_patch: bool = False) -> tuple[bool, str]:
+def _validate_workload_patch(
+    patch: dict,
+    allow_volume_patch: bool = False,
+    allow_init_containers: bool = False,
+) -> tuple[bool, str]:
     if not isinstance(patch, dict):
         return False, "patch must be a JSON object"
     spec = patch.get("spec")
@@ -1225,6 +1261,8 @@ def _validate_workload_patch(patch: dict, allow_volume_patch: bool = False) -> t
             allowed_pod_spec = {"containers", "securityContext", "imagePullSecrets", "nodeSelector", "tolerations", "affinity"}
             if allow_volume_patch:
                 allowed_pod_spec.add("volumes")
+            if allow_init_containers:
+                allowed_pod_spec.add("initContainers")
             illegal_pod_spec = set(pod_spec) - allowed_pod_spec
             if illegal_pod_spec:
                 return False, f"unsupported template.spec fields: {sorted(illegal_pod_spec)}"
@@ -1278,6 +1316,18 @@ def _validate_workload_patch(patch: dict, allow_volume_patch: bool = False) -> t
                 csc = container.get("securityContext") or {}
                 if csc and set(csc) - {"runAsUser", "runAsGroup", "runAsNonRoot", "allowPrivilegeEscalation", "readOnlyRootFilesystem"}:
                     return False, "container.securityContext contains unsupported fields"
+            init_containers = pod_spec.get("initContainers") or []
+            if init_containers:
+                if not allow_init_containers or not isinstance(init_containers, list):
+                    return False, "template.spec.initContainers requires high-risk approval"
+                for init_container in init_containers:
+                    if not isinstance(init_container, dict) or not init_container.get("name") or not init_container.get("image"):
+                        return False, "initContainer requires name and image"
+                    command_text = " ".join((init_container.get("command") or []) + (init_container.get("args") or [])).lower()
+                    if any(term in command_text for term in ("rm -rf", "mkfs", "dd if=", "mount ", "umount ", "curl ", "wget ")):
+                        return False, "initContainer command contains a destructive or network operation"
+                    if command_text and not any(term in command_text for term in ("chown", "chmod", "mkdir", "test", "id", "ls")):
+                        return False, "initContainer is limited to bounded ownership and permission repair"
     return True, ""
 
 
@@ -1292,7 +1342,7 @@ def patch_workload(
 ) -> dict:
     """Patch a common apps/v1 workload using Kubernetes merge patch.
 
-    Supported workload_type: Deployment, StatefulSet, DaemonSet.
+    Supported workload_type: Deployment, StatefulSet, DaemonSet, Job, CronJob.
     This intentionally accepts a prepared merge-patch object only; the caller
     must show it to a human before dry_run=False in production workflows.
     """
@@ -1302,7 +1352,11 @@ def patch_workload(
         raise ValueError("workload_type must be Deployment, StatefulSet, or DaemonSet")
     if not isinstance(patch, dict) or not patch:
         raise ValueError("patch must be a non-empty object")
-    valid, reason = _validate_workload_patch(patch, allow_volume_patch=high_risk_volume_patch)
+    valid, reason = _validate_workload_patch(
+        patch,
+        allow_volume_patch=high_risk_volume_patch,
+        allow_init_containers=high_risk_volume_patch,
+    )
     if not valid:
         raise ValueError(f"patch rejected by safety policy: {reason}")
     if dry_run:
@@ -1316,8 +1370,16 @@ def patch_workload(
             "message": "Dry run only. No workload patched.",
         }
     try:
+        normalized = str(workload_type).lower()
+        api_group = "batch/v1" if normalized in {"job", "jobs", "cronjob", "cronjobs"} else "apps/v1"
+        if normalized in {"cronjob", "cronjobs"}:
+            spec = dict((patch or {}).get("spec") or {})
+            template = spec.pop("template", None)
+            if template is not None:
+                spec.setdefault("jobTemplate", {}).setdefault("spec", {})["template"] = template
+            patch = {"spec": spec}
         result = _k8s_patch(
-            f"/apis/apps/v1/namespaces/{namespace}/{resource}/{workload_name}",
+            f"/apis/{api_group}/namespaces/{namespace}/{resource}/{workload_name}",
             patch,
         )
         return {
@@ -1332,6 +1394,135 @@ def patch_workload(
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+@mcp.tool()
+def replace_immutable_workload(
+    namespace: str,
+    kind: str,
+    name: str,
+    pod_template_patch: dict,
+    dry_run: bool = True,
+) -> dict:
+    """Safely recreate an approved standalone Pod or Job with one bounded Pod-spec patch."""
+    check_namespace(namespace)
+    normalized = str(kind or "").lower()
+    if normalized not in {"pod", "job"}:
+        raise ValueError("kind must be Pod or Job")
+    if not _valid_k8s_name(name):
+        raise ValueError("name is not a valid Kubernetes name")
+    valid, reason = _validate_workload_patch(
+        pod_template_patch,
+        allow_volume_patch=False,
+        allow_init_containers=True,
+    )
+    if not valid:
+        raise ValueError(f"patch rejected by safety policy: {reason}")
+    resource = "pods" if normalized == "pod" else "jobs"
+    prefix = "/api/v1" if normalized == "pod" else "/apis/batch/v1"
+    q_namespace = quote(namespace, safe="")
+    q_name = quote(name, safe="")
+    item_path = f"{prefix}/namespaces/{q_namespace}/{resource}/{q_name}"
+    collection_path = f"{prefix}/namespaces/{q_namespace}/{resource}"
+    if dry_run:
+        return {
+            "action": "replace_immutable_workload",
+            "kind": "Pod" if normalized == "pod" else "Job",
+            "name": name,
+            "namespace": namespace,
+            "patch": pod_template_patch,
+            "dry_run": True,
+            "message": "Dry run only. The live object was not deleted or recreated.",
+        }
+
+    try:
+        replacement = copy.deepcopy(_k8s_get(item_path))
+        owners = ((replacement.get("metadata") or {}).get("ownerReferences") or [])
+        if owners:
+            raise ValueError(
+                f"controller-owned {'Pod' if normalized == 'pod' else 'Job'} "
+                "must be patched through its highest controller"
+            )
+        pod_spec = (
+            replacement.setdefault("spec", {})
+            if normalized == "pod"
+            else replacement.setdefault("spec", {}).setdefault("template", {}).setdefault("spec", {})
+        )
+
+        def merge(target: dict, patch: dict) -> None:
+            for key, value in patch.items():
+                if key == "containers" and isinstance(value, list):
+                    existing = {
+                        str(entry.get("name") or ""): entry
+                        for entry in target.get("containers") or []
+                        if isinstance(entry, dict)
+                    }
+                    for container_patch in value:
+                        current = existing.get(str((container_patch or {}).get("name") or ""))
+                        if current is None:
+                            raise ValueError("container patch target does not exist")
+                        merge(current, container_patch)
+                elif isinstance(value, dict) and isinstance(target.get(key), dict):
+                    merge(target[key], value)
+                else:
+                    target[key] = copy.deepcopy(value)
+
+        canonical_spec = (
+            (((pod_template_patch.get("spec") or {}).get("template") or {}).get("spec") or {})
+        )
+        merge(pod_spec, canonical_spec)
+        replacement.pop("status", None)
+        metadata = replacement.setdefault("metadata", {})
+        for field in (
+            "uid", "resourceVersion", "generation", "creationTimestamp",
+            "deletionTimestamp", "deletionGracePeriodSeconds", "managedFields",
+        ):
+            metadata.pop(field, None)
+        if normalized == "job":
+            generated_labels = {
+                "controller-uid",
+                "batch.kubernetes.io/controller-uid",
+                "job-name",
+                "batch.kubernetes.io/job-name",
+            }
+            job_spec = replacement.setdefault("spec", {})
+            job_spec.pop("selector", None)
+            job_spec.pop("manualSelector", None)
+            for label_map in (
+                metadata.get("labels"),
+                ((job_spec.get("template") or {}).get("metadata") or {}).get("labels"),
+            ):
+                if isinstance(label_map, dict):
+                    for label in generated_labels:
+                        label_map.pop(label, None)
+
+        _k8s_delete(
+            item_path,
+            {"apiVersion": "v1", "kind": "DeleteOptions", "propagationPolicy": "Foreground"},
+        )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                _k8s_get(item_path)
+            except HTTPError as exc:
+                if exc.code == 404:
+                    break
+                raise
+            time.sleep(0.5)
+        else:
+            raise TimeoutError(f"{kind}/{name} was not deleted within 30 seconds")
+        result = _k8s_post(collection_path, replacement)
+        return {
+            "action": "replace_immutable_workload",
+            "kind": "Pod" if normalized == "pod" else "Job",
+            "name": name,
+            "namespace": namespace,
+            "dry_run": False,
+            "message": f"{kind}/{name} recreated from its approved live snapshot.",
+            "resource_version": (result.get("metadata") or {}).get("resourceVersion"),
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 def _validate_create_workload_manifest(manifest: dict) -> tuple[bool, str]:
@@ -1959,6 +2150,7 @@ __all__ = [
     "list_nodes",
     "check_access",
     "patch_workload",
+    "replace_immutable_workload",
     "create_workload",
     "patch_service",
     "patch_pdb",

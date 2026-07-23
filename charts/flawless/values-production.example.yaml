@@ -11,7 +11,7 @@ namespaceOverride: k8s-agent
 
 image:
   repository: m.daocloud.io/ghcr.io/your-org/flawless
-  tag: 3.2.2
+  tag: 3.2.3
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -71,6 +71,11 @@ config:
   AUTO_OPS_STATIC_PV_NFS_SERVER: ""
   AUTO_OPS_STATIC_PV_RECLAIM_POLICY: Retain
   AUTO_OPS_STATIC_PV_TEMPLATE_JSON: '{}'
+  AUTO_OPS_STATIC_PV_TEMPLATES_JSON: '{}'
+  # Per-cluster local/host-path roots. Empty means deny local PV automation.
+  # Example: {"cluster-a":["/srv/k8s-local"]}
+  AUTO_OPS_HOSTPATH_BASE_PATHS_JSON: '{}'
+  AUTO_OPS_ALLOW_LOCAL_STATIC_PV: "false"
 
   # Autonomous escalation is disabled. Every mutating step requires a matched
   # Skill and explicit operator approval.
@@ -78,6 +83,9 @@ config:
   OPS_MUTATION_ENABLED: "true"
   OPS_STEPWISE_CONFIRMATION_REQUIRED: "true"
   SKILL_EXECUTION_REQUIRED: "true"
+  OPS_RECOVERY_STABILITY_SECONDS: "180"
+  OPS_RECORD_RETENTION_DAYS: "365"
+  OPS_JOB_STORE_LIMIT: "5000"
 
   BEYLA_FLOW_QUERY_WINDOW: 5m
   BEYLA_LOKI_FLOW_ENABLED: "true"

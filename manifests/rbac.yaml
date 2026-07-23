@@ -66,6 +66,12 @@ rules:
       - replicasets
     verbs: [get, list, watch]
 
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: [get, list, watch]
+
   - apiGroups: ["autoscaling"]
     resources:
       - horizontalpodautoscalers
@@ -141,6 +147,11 @@ rules:
       - statefulsets/scale
       - daemonsets
     verbs: [get, patch]
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: [get, create, patch, update, delete]
 
   # Namespace RoleBinding + ALLOWED_NAMESPACES remain the two authorization
   # boundaries for every mutable action.

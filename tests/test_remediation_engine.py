@@ -308,7 +308,8 @@ class RemediationEngineTests(unittest.TestCase):
         )
         self.assertEqual(plan["runbook_id"], "storage_mount")
         self.assertGreater(plan["hypotheses"][0]["confidence"], 0.9)
-        self.assertIn("AUTO_OPS_STATIC_PV", plan["evidence_gap"])
+        self.assertIn("provisioner=未确认", plan["evidence_gap"])
+        self.assertIn("禁止", plan["evidence_gap"])
 
     def test_image_pull_auth_also_patches_service_account(self):
         old_secret = os.environ.get("DEFAULT_IMAGE_PULL_SECRET")
@@ -525,6 +526,7 @@ class RemediationEngineTests(unittest.TestCase):
                     "storage": [{
                         "volume": "data", "pvc": "data-vol", "pvc_phase": "Pending",
                         "requested": "5Gi", "access_modes": ["ReadWriteMany"], "storage_class": "nfs-static",
+                        "storage_class_provisioner": "kubernetes.io/no-provisioner",
                     }],
                     "events": {"events": [{"reason": "FailedMount", "message": "no persistent volumes available for this claim"}]},
                 },
@@ -541,6 +543,114 @@ class RemediationEngineTests(unittest.TestCase):
                 os.environ.pop("AUTO_OPS_STATIC_PV_NFS_BASE_PATH", None)
             else:
                 os.environ["AUTO_OPS_STATIC_PV_NFS_BASE_PATH"] = old_path
+
+    def test_dynamic_storage_class_never_creates_competing_static_pv(self):
+        old_server = os.environ.get("AUTO_OPS_STATIC_PV_NFS_SERVER")
+        old_path = os.environ.get("AUTO_OPS_STATIC_PV_NFS_BASE_PATH")
+        os.environ["AUTO_OPS_STATIC_PV_NFS_SERVER"] = "192.0.2.10"
+        os.environ["AUTO_OPS_STATIC_PV_NFS_BASE_PATH"] = "/exports/k8s"
+        try:
+            plan = build_remediation_plan(
+                self.alert,
+                {"root_cause": "FailedScheduling"},
+                {
+                    "pod": self.pod,
+                    "pods": [self.pod],
+                    "storage": [{
+                        "volume": "data",
+                        "pvc": "data-vol",
+                        "pvc_phase": "Pending",
+                        "requested": "5Gi",
+                        "access_modes": ["ReadWriteMany"],
+                        "storage_class": "nas-dynamic",
+                        "storage_class_provisioner": "csi.example.invalid",
+                    }],
+                    "events": {"events": [{
+                        "reason": "FailedScheduling",
+                        "message": "pod has unbound immediate PersistentVolumeClaims",
+                    }]},
+                },
+            )
+            self.assertEqual(plan["changes"], [])
+            self.assertIn("provisioner=", plan["evidence_gap"])
+            self.assertIn("禁止", plan["evidence_gap"])
+            self.assertIn("静态 PV", plan["evidence_gap"])
+        finally:
+            if old_server is None:
+                os.environ.pop("AUTO_OPS_STATIC_PV_NFS_SERVER", None)
+            else:
+                os.environ["AUTO_OPS_STATIC_PV_NFS_SERVER"] = old_server
+            if old_path is None:
+                os.environ.pop("AUTO_OPS_STATIC_PV_NFS_BASE_PATH", None)
+            else:
+                os.environ["AUTO_OPS_STATIC_PV_NFS_BASE_PATH"] = old_path
+
+    def test_job_replacement_removes_generated_selector_and_labels(self):
+        raw = {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "repair",
+                "namespace": "prod",
+                "uid": "generated",
+                "resourceVersion": "9",
+                "labels": {"batch.kubernetes.io/controller-uid": "generated", "team": "sre"},
+            },
+            "spec": {
+                "selector": {"matchLabels": {"batch.kubernetes.io/controller-uid": "generated"}},
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "batch.kubernetes.io/controller-uid": "generated",
+                            "batch.kubernetes.io/job-name": "repair",
+                            "team": "sre",
+                        }
+                    },
+                    "spec": {
+                        "restartPolicy": "Never",
+                        "containers": [{"name": "repair", "image": "example.invalid/repair:v1"}],
+                    },
+                },
+            },
+            "status": {"active": 1},
+        }
+        replacement = server._prepare_immutable_replacement(
+            raw,
+            "Job",
+            {"spec": {"template": {"spec": {"containers": [{
+                "name": "repair",
+                "securityContext": {"runAsUser": 0, "runAsGroup": 0, "runAsNonRoot": False},
+            }]}}}},
+        )
+        self.assertNotIn("status", replacement)
+        self.assertNotIn("uid", replacement["metadata"])
+        self.assertNotIn("resourceVersion", replacement["metadata"])
+        self.assertNotIn("selector", replacement["spec"])
+        self.assertEqual(replacement["metadata"]["labels"], {"team": "sre"})
+        self.assertEqual(replacement["spec"]["template"]["metadata"]["labels"], {"team": "sre"})
+        security = replacement["spec"]["template"]["spec"]["containers"][0]["securityContext"]
+        self.assertEqual(security["runAsUser"], 0)
+
+    def test_controller_owned_immutable_object_cannot_be_recreated(self):
+        raw = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "api-abc",
+                "namespace": "prod",
+                "ownerReferences": [{"kind": "ReplicaSet", "name": "api-123"}],
+            },
+            "spec": {"containers": [{"name": "api", "image": "example.invalid/api:v1"}]},
+        }
+        with self.assertRaisesRegex(ValueError, "highest controller"):
+            server._prepare_immutable_replacement(
+                raw,
+                "Pod",
+                {"spec": {"template": {"spec": {"containers": [{
+                    "name": "api",
+                    "securityContext": {"runAsUser": 0},
+                }]}}}},
+            )
 
     def test_pending_pvc_can_use_explicit_local_static_pv_for_e2e_only(self):
         old_allow = os.environ.get("AUTO_OPS_ALLOW_LOCAL_STATIC_PV")
@@ -561,6 +671,7 @@ class RemediationEngineTests(unittest.TestCase):
                     "storage": [{
                         "volume": "data", "pvc": "data-vol", "pvc_phase": "Pending",
                         "requested": "256Mi", "access_modes": ["ReadWriteOnce"], "storage_class": "manual-static",
+                        "storage_class_provisioner": "kubernetes.io/no-provisioner",
                     }],
                     "events": {"events": [{"reason": "FailedScheduling", "message": "pod has unbound immediate PersistentVolumeClaims"}]},
                 },

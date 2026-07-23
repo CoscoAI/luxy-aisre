@@ -317,6 +317,7 @@ class ClusterRegistry:
         api_client = self.api_client(cluster_id)
         core = client.CoreV1Api(api_client)
         apps = client.AppsV1Api(api_client)
+        batch = client.BatchV1Api(api_client)
         encode = api_client.sanitize_for_serialization
         nodes = encode(core.list_node(limit=500)).get("items", [])
         namespaces = encode(core.list_namespace(limit=1000)).get("items", [])
@@ -325,6 +326,8 @@ class ClusterRegistry:
         statefulsets = encode(apps.list_stateful_set_for_all_namespaces(limit=2000)).get("items", [])
         daemonsets = encode(apps.list_daemon_set_for_all_namespaces(limit=2000)).get("items", [])
         replicasets = encode(apps.list_replica_set_for_all_namespaces(limit=5000)).get("items", [])
+        jobs = encode(batch.list_job_for_all_namespaces(limit=3000)).get("items", [])
+        cronjobs = encode(batch.list_cron_job_for_all_namespaces(limit=2000)).get("items", [])
         services = encode(core.list_service_for_all_namespaces(limit=3000)).get("items", [])
         networking = client.NetworkingV1Api(api_client)
         ingresses = encode(networking.list_ingress_for_all_namespaces(limit=2000)).get("items", [])
@@ -336,6 +339,8 @@ class ClusterRegistry:
             "statefulsets": statefulsets,
             "daemonsets": daemonsets,
             "replicasets": replicasets,
+            "jobs": jobs,
+            "cronjobs": cronjobs,
             "services": services,
             "ingresses": ingresses,
         }
@@ -345,6 +350,8 @@ class ClusterRegistry:
         encode = api_client.sanitize_for_serialization
         core = client.CoreV1Api(api_client)
         apps = client.AppsV1Api(api_client)
+        batch = client.BatchV1Api(api_client)
+        storage_api = client.StorageV1Api(api_client)
         raw_pod = encode(core.read_namespaced_pod(pod_name, namespace))
         field_selector = f"involvedObject.name={pod_name}"
         events = encode(core.list_namespaced_event(namespace, field_selector=field_selector, limit=500)).get("items", [])
@@ -375,13 +382,24 @@ class ClusterRegistry:
             replica = encode(apps.read_namespaced_replica_set(owner.get("name"), namespace))
             replica_owners = (replica.get("metadata") or {}).get("ownerReferences") or []
             owner = replica_owners[0] if replica_owners else owner
+        elif owner.get("kind") == "Job" and owner.get("name"):
+            job = encode(batch.read_namespaced_job(owner.get("name"), namespace))
+            job_owners = (job.get("metadata") or {}).get("ownerReferences") or []
+            if job_owners and job_owners[0].get("kind") == "CronJob":
+                owner = job_owners[0]
+            else:
+                workload = job
         readers = {
             "Deployment": apps.read_namespaced_deployment,
             "StatefulSet": apps.read_namespaced_stateful_set,
             "DaemonSet": apps.read_namespaced_daemon_set,
+            "Job": batch.read_namespaced_job,
+            "CronJob": batch.read_namespaced_cron_job,
         }
-        if owner.get("kind") in readers and owner.get("name"):
+        if not workload and owner.get("kind") in readers and owner.get("name"):
             workload = encode(readers[owner["kind"]](owner["name"], namespace))
+        if not owner:
+            workload = raw_pod
         storage = []
         for volume in (raw_pod.get("spec") or {}).get("volumes") or []:
             claim = (volume.get("persistentVolumeClaim") or {}).get("claimName")
@@ -391,7 +409,34 @@ class ClusterRegistry:
                 pvc = encode(core.read_namespaced_persistent_volume_claim(claim, namespace))
                 pv_name = (pvc.get("spec") or {}).get("volumeName")
                 pv = encode(core.read_persistent_volume(pv_name)) if pv_name else {}
-                storage.append({"volume": volume.get("name"), "pvc": claim, "pvc_phase": (pvc.get("status") or {}).get("phase"), "requested": ((((pvc.get("spec") or {}).get("resources") or {}).get("requests") or {}).get("storage")), "capacity": ((pvc.get("status") or {}).get("capacity") or {}).get("storage"), "storage_class": (pvc.get("spec") or {}).get("storageClassName"), "access_modes": (pvc.get("spec") or {}).get("accessModes") or [], "pv": pv_name, "pv_phase": (pv.get("status") or {}).get("phase"), "csi_driver": (((pv.get("spec") or {}).get("csi") or {}).get("driver")), "nfs": bool((pv.get("spec") or {}).get("nfs"))})
+                storage_class = (pvc.get("spec") or {}).get("storageClassName")
+                storage_class_record = {}
+                if storage_class:
+                    try:
+                        storage_class_record = encode(storage_api.read_storage_class(storage_class))
+                    except Exception as exc:
+                        storage_class_record = {"error": f"{type(exc).__name__}: {exc}"}
+                storage.append({
+                    "volume": volume.get("name"),
+                    "pvc": claim,
+                    "pvc_phase": (pvc.get("status") or {}).get("phase"),
+                    "requested": ((((pvc.get("spec") or {}).get("resources") or {}).get("requests") or {}).get("storage")),
+                    "capacity": ((pvc.get("status") or {}).get("capacity") or {}).get("storage"),
+                    "storage_class": storage_class,
+                    "storage_class_provisioner": storage_class_record.get("provisioner"),
+                    "volume_binding_mode": storage_class_record.get("volumeBindingMode"),
+                    "allow_volume_expansion": storage_class_record.get("allowVolumeExpansion"),
+                    "storage_class_error": storage_class_record.get("error"),
+                    "access_modes": (pvc.get("spec") or {}).get("accessModes") or [],
+                    "volume_mode": (pvc.get("spec") or {}).get("volumeMode") or "Filesystem",
+                    "selector": (pvc.get("spec") or {}).get("selector") or {},
+                    "pv": pv_name,
+                    "pv_phase": (pv.get("status") or {}).get("phase"),
+                    "pv_reclaim_policy": (pv.get("spec") or {}).get("persistentVolumeReclaimPolicy"),
+                    "pv_node_affinity": (pv.get("spec") or {}).get("nodeAffinity") or {},
+                    "csi_driver": (((pv.get("spec") or {}).get("csi") or {}).get("driver")),
+                    "nfs": bool((pv.get("spec") or {}).get("nfs")),
+                })
             except Exception as exc:
                 storage.append({"volume": volume.get("name"), "pvc": claim, "error": f"{type(exc).__name__}: {exc}"})
         pod_labels = (raw_pod.get("metadata") or {}).get("labels") or {}
@@ -522,6 +567,106 @@ class ClusterRegistry:
             kwargs["namespace"] = namespace or "default"
         result = resource.delete(**kwargs)
         return result.to_dict() if hasattr(result, "to_dict") else {"status": "accepted"}
+
+    def replace_immutable_workload(
+        self,
+        cluster_id: str,
+        *,
+        kind: str,
+        name: str,
+        namespace: str,
+        pod_template_patch: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Replace a standalone Pod or Job from its live object after applying a bounded template patch."""
+        normalized = str(kind or "").lower()
+        if normalized not in {"pod", "job"}:
+            raise ValueError("immutable replacement only supports Pod or Job")
+        api_client = self.api_client(cluster_id)
+        encode = api_client.sanitize_for_serialization
+        core = client.CoreV1Api(api_client)
+        batch = client.BatchV1Api(api_client)
+        if normalized == "pod":
+            raw = encode(core.read_namespaced_pod(name, namespace))
+            if (raw.get("metadata") or {}).get("ownerReferences"):
+                raise ValueError("controller-owned Pod must be patched through its highest controller")
+            pod_spec = raw.setdefault("spec", {})
+        else:
+            raw = encode(batch.read_namespaced_job(name, namespace))
+            if (raw.get("metadata") or {}).get("ownerReferences"):
+                raise ValueError("controller-owned Job must be patched through its highest controller")
+            pod_spec = raw.setdefault("spec", {}).setdefault("template", {}).setdefault("spec", {})
+
+        def merge(target: dict[str, Any], patch: dict[str, Any]) -> None:
+            for key, value in patch.items():
+                if key == "containers" and isinstance(value, list):
+                    existing = {str(item.get("name") or ""): item for item in target.get(key) or [] if isinstance(item, dict)}
+                    for item in value:
+                        current = existing.get(str((item or {}).get("name") or ""))
+                        if current is None:
+                            raise ValueError("container patch target does not exist")
+                        merge(current, item)
+                elif isinstance(value, dict) and isinstance(target.get(key), dict):
+                    merge(target[key], value)
+                else:
+                    target[key] = value
+
+        canonical_spec = (((pod_template_patch.get("spec") or {}).get("template") or {}).get("spec") or {})
+        merge(pod_spec, canonical_spec)
+        raw.pop("status", None)
+        metadata = raw.setdefault("metadata", {})
+        for key in (
+            "uid", "resourceVersion", "generation", "creationTimestamp",
+            "deletionTimestamp", "deletionGracePeriodSeconds", "managedFields",
+        ):
+            metadata.pop(key, None)
+        if normalized == "job":
+            generated_labels = {
+                "controller-uid",
+                "batch.kubernetes.io/controller-uid",
+                "job-name",
+                "batch.kubernetes.io/job-name",
+            }
+            job_spec = raw.setdefault("spec", {})
+            job_spec.pop("selector", None)
+            job_spec.pop("manualSelector", None)
+            for label_map in (
+                metadata.get("labels"),
+                ((job_spec.get("template") or {}).get("metadata") or {}).get("labels"),
+            ):
+                if isinstance(label_map, dict):
+                    for label in generated_labels:
+                        label_map.pop(label, None)
+        delete_options = client.V1DeleteOptions(propagation_policy="Foreground")
+        if normalized == "pod":
+            core.delete_namespaced_pod(name, namespace, body=delete_options)
+        else:
+            batch.delete_namespaced_job(name, namespace, body=delete_options)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                if normalized == "pod":
+                    core.read_namespaced_pod(name, namespace)
+                else:
+                    batch.read_namespaced_job(name, namespace)
+            except client.exceptions.ApiException as exc:
+                if exc.status == 404:
+                    break
+                raise
+            time.sleep(0.5)
+        else:
+            raise TimeoutError(f"{kind}/{name} was not deleted within 30 seconds")
+        created = (
+            core.create_namespaced_pod(namespace, raw)
+            if normalized == "pod"
+            else batch.create_namespaced_job(namespace, raw)
+        )
+        result = encode(created)
+        return {
+            "operation": "replaced",
+            "kind": kind,
+            "name": name,
+            "resource_version": (result.get("metadata") or {}).get("resourceVersion"),
+        }
 
     def exec_pod(self, cluster_id: str, *, namespace: str, pod_name: str, container_name: str, command: str, timeout_seconds: int) -> dict[str, Any]:
         return self.exec_pod_with_configuration(

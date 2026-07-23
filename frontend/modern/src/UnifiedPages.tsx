@@ -475,6 +475,7 @@ function SkillMultiSelect({
 
 export function OpsSkillsPage() {
   const [skills, refreshSkills] = useAsync<any>(() => apiGet("/api/ops/skills"), []);
+  const [records, refreshRecords] = useAsync<any>(() => apiGet("/api/ops/records?limit=100"), []);
   const [capabilities] = useAsync<any>(() => apiGet("/api/ops/capabilities"), []);
   const [form, setForm] = useState<SkillForm>(() => createEmptySkillForm());
   const [saving, setSaving] = useState(false);
@@ -607,6 +608,16 @@ export function OpsSkillsPage() {
     window.location.assign(`/api/ops/skills/${encodeURIComponent(skill.id)}/export`);
   }
 
+  async function deleteRecord(record: any) {
+    if (!window.confirm(`确定删除运维记录 ${record.id}？聚合 Skill 统计不会随单条记录删除。`)) return;
+    try {
+      await apiDelete(`/api/ops/records/${encodeURIComponent(record.id)}`);
+      refreshRecords();
+    } catch (error: any) {
+      setMessage(error.message);
+    }
+  }
+
   return <div className="skill-workbench">
     <div className="surface">
       <SectionHead icon={BrainCircuit} title="运维 Skill 注入" meta="保存即生成标准 SKILL.md，可跨智能体复用" action={<div className="skill-head-actions"><input ref={importInput} type="file" accept=".zip,application/zip" hidden onChange={(event) => importSkill(event.target.files?.[0])} /><button className="ghost" onClick={() => importInput.current?.click()} disabled={importing}>{importing ? <Loader2 className="spin" size={15} /> : <Upload size={15} />}导入 Skill</button><button className="ghost" onClick={refreshSkills}><RefreshCcw size={15} />刷新</button></div>} />
@@ -682,6 +693,28 @@ export function OpsSkillsPage() {
           {skill.script_policy?.enabled && <div className="skill-script-badge"><TerminalSquare size={13} /><span>批准脚本：{skill.script_policy.script_id}</span></div>}
           <footer><small>{skill.builtin ? "内置" : skill.lifecycle === "candidate" ? "AI 从成功恢复中沉淀" : "自定义"} · {skill.owner || "operator"} · {skill.execution_ready ? "可执行映射" : "指令型"}</small><div><button className="ghost tiny" onClick={() => exportSkill(skill)} title="导出标准 Agent Skill ZIP"><Download size={13} />导出</button><button className="ghost tiny" onClick={() => editSkill(skill)}>{skill.lifecycle === "candidate" ? "审核并发布" : "编辑"}</button><button className="ghost tiny" onClick={() => disableSkill(skill)}>{skill.builtin ? "禁用" : "删除"}</button></div></footer>
         </article>)}
+      </div>
+    </div>
+    <div className="surface span-two">
+      <SectionHead
+        icon={FileClock}
+        title="运维 Records 与 Skill 成效"
+        meta={`保留 ${records.data?.retention_days || 365} 天 · 调用只统计实际 executed`}
+        action={<div className="skill-head-actions"><button className="ghost" onClick={() => window.location.assign("/api/ops/records/export?limit=1000")}><Download size={14} />导出</button><button className="ghost" onClick={refreshRecords}><RefreshCcw size={14} />刷新</button></div>}
+      />
+      <div className="skill-stat-grid">
+        {list(records.data?.skill_stats?.skills).map((item: any) => <article key={item.skill_id}>
+          <strong>{item.skill_name}</strong><small>{item.skill_id}</small>
+          <div><span>匹配<b>{item.matched || 0}</b></span><span>选中<b>{item.selected || 0}</b></span><span>审批<b>{item.approval_requested || 0}</b></span><span>调用<b>{item.executed || 0}</b></span><span>成功<b>{item.succeeded || 0}</b></span><span>失败<b>{item.failed || 0}</b></span><span>回滚<b>{item.rolled_back || 0}</b></span></div>
+        </article>)}
+      </div>
+      <div className="ops-record-list">
+        {list(records.data?.items).map((record: any) => <article key={record.id}>
+          <div><StatusPill status={record.status || "unknown"} /><strong>{record.target || record.id}</strong><small>{record.cluster || "-"} / {record.namespace || "-"} · {timeText(record.created_at)}</small></div>
+          <p>{record.message || record.stage}{record.result?.verification?.residual_risk ? ` · 残余风险：${record.result.verification.residual_risk}` : ""}</p>
+          <footer><span>{list(record.history).length} 轮 · {list(record.events).length} 条事件</span><button className="ghost tiny" onClick={() => deleteRecord(record)} disabled={["queued", "running", "awaiting_approval", "cancelling", "resume_pending"].includes(record.status)}><Trash2 size={12} />删除</button></footer>
+        </article>)}
+        {!list(records.data?.items).length && <Empty text="完成一次运维执行后，这里会保存脱敏证据、审批、Skill 与验证记录" />}
       </div>
     </div>
   </div>;
